@@ -18,6 +18,10 @@
 
 #pragma once
 
+#include <cstdint>
+#include <type_traits>
+#include <utility>
+
 namespace c10 {
 
 /// An efficient, type-erasing, non-owning reference to a callable. This is
@@ -26,40 +30,46 @@ namespace c10 {
 ///
 /// This class does not own the callable, so it is not in general safe to store
 /// a function_ref.
-template<typename Fn> class function_ref;
+template <typename Fn>
+class function_ref;
 
-template<typename Ret, typename ...Params>
+template <typename Ret, typename... Params>
 class function_ref<Ret(Params...)> {
-Ret (*callback)(intptr_t callable, Params ...params) = nullptr;
-intptr_t callable;
+  Ret (*callback)(intptr_t callable, Params... params) = nullptr;
+  intptr_t callable{};
 
-template<typename Callable>
-static Ret callback_fn(intptr_t callable, Params ...params) {
+  template <typename Callable>
+  static Ret callback_fn(intptr_t callable, Params... params) {
     return (*reinterpret_cast<Callable*>(callable))(
         std::forward<Params>(params)...);
-}
+  }
 
-public:
-function_ref() = default;
-function_ref(std::nullptr_t) {}
+ public:
+  function_ref() = default;
+  function_ref(std::nullptr_t) {}
 
-template <typename Callable>
-function_ref(Callable &&callable,
-            typename std::enable_if<
-                !std::is_same<typename std::remove_reference<Callable>::type,
-                                function_ref>::value>::type * = nullptr,
-            typename std::enable_if<
-                 std::is_convertible<
-                   typename std::result_of<Callable&&(Params&&...)>::type,
-                   Ret>::value>::type * = nullptr)
-    : callback(callback_fn<typename std::remove_reference<Callable>::type>),
+  template <typename Callable>
+  function_ref(
+      // NOLINTNEXTLINE(cppcoreguidelines-missing-std-forward)
+      Callable&& callable,
+      std::enable_if_t<!std::is_same_v<
+          std::remove_reference_t<Callable>,
+          function_ref>>* /*unused*/
+      = nullptr,
+      std::enable_if_t<std::is_convertible_v<
+          typename std::invoke_result_t<Callable, Params...>,
+          Ret>>* /*unused*/
+      = nullptr)
+      : callback(callback_fn<std::remove_reference_t<Callable>>),
         callable(reinterpret_cast<intptr_t>(&callable)) {}
 
-Ret operator()(Params ...params) const {
+  Ret operator()(Params... params) const {
     return callback(callable, std::forward<Params>(params)...);
-}
+  }
 
-operator bool() const { return callback; }
+  operator bool() const {
+    return callback;
+  }
 };
- 
-}
+
+} // namespace c10

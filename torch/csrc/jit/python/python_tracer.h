@@ -8,15 +8,13 @@
 #include <memory>
 #include <string>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 struct Module;
 
 namespace tracer {
 void initPythonTracerBindings(PyObject* module);
 
-std::string getPythonInterpreterStackTrace();
 SourceRange getPythonInterpreterSourceRange();
 
 Node* preRecordPythonTrace(
@@ -25,13 +23,23 @@ Node* preRecordPythonTrace(
     at::ArrayRef<autograd::Variable> inputs,
     std::vector<THPObjectPtr> scalar_args);
 
+std::pair<std::shared_ptr<Graph>, Stack> createGraphByTracingWithDict(
+    const py::function& func,
+    const py::dict& inputs_dict,
+    const Stack& inputs,
+    const py::function& var_name_lookup_fn,
+    bool strict,
+    bool force_outplace,
+    Module* self = nullptr,
+    const std::vector<std::string>& argument_names = {});
+
 std::pair<std::shared_ptr<Graph>, Stack> createGraphByTracing(
     const py::function& func,
     Stack inputs,
     const py::function& var_name_lookup_fn,
     bool strict,
     bool force_outplace,
-    Module* self = nullptr);
+    Module* self = nullptr,
+    const std::vector<std::string>& argument_names = {});
 } // namespace tracer
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

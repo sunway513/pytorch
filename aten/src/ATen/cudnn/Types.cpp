@@ -1,24 +1,38 @@
 #include <ATen/cudnn/Types.h>
 
-#include <ATen/ATen.h>
 
-namespace at { namespace native {
+#include <c10/util/Exception.h>
+
+namespace at::native {
+
+cudnnDataType_t getCudnnDataTypeFromScalarType(const at::ScalarType dtype) {
+  if (dtype == c10::kQInt8 || dtype == at::kChar) {
+    return CUDNN_DATA_INT8;
+  } else if (dtype == at::kFloat) {
+    return CUDNN_DATA_FLOAT;
+  } else if (dtype == at::kDouble) {
+    return CUDNN_DATA_DOUBLE;
+  } else if (dtype == at::kHalf) {
+    return CUDNN_DATA_HALF;
+  } else if (dtype == at::kBFloat16) {
+    return CUDNN_DATA_BFLOAT16;
+  } else if (dtype == at::kInt) {
+    return CUDNN_DATA_INT32;
+  } else if (dtype == at::kByte) {
+    return CUDNN_DATA_UINT8;
+  }
+  TORCH_CHECK(false,
+    "getCudnnDataTypeFromScalarType() not supported for ",
+    toString(dtype)
+  );
+}
 
 cudnnDataType_t getCudnnDataType(const at::Tensor& tensor) {
-  if (tensor.scalar_type() == at::kFloat) {
-    return CUDNN_DATA_FLOAT;
-  } else if (tensor.scalar_type() == at::kDouble) {
-    return CUDNN_DATA_DOUBLE;
-  } else if (tensor.scalar_type() == at::kHalf) {
-    return CUDNN_DATA_HALF;
-  }
-  std::string msg("getCudnnDataType() not supported for ");
-  msg += toString(tensor.scalar_type());
-  throw std::runtime_error(msg);
+  return getCudnnDataTypeFromScalarType(tensor.scalar_type());
 }
 
 int64_t cudnn_version() {
   return CUDNN_VERSION;
 }
 
-}}  // namespace at::cudnn
+} // namespace at::native

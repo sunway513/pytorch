@@ -1,9 +1,19 @@
-#include <ATen/ATen.h>
-#include <ATen/NativeFunctions.h>
+#define TORCH_ASSERT_ONLY_METHOD_OPERATORS
+#include <ATen/core/Tensor.h>
+#include <c10/util/irange.h>
 #include <tuple>
 
-namespace at {
-namespace native {
+#ifndef AT_PER_OPERATOR_HEADERS
+#include <ATen/Functions.h>
+#include <ATen/NativeFunctions.h>
+#else
+#include <ATen/ops/conv_tbc_backward_native.h>
+#include <ATen/ops/conv_tbc_native.h>
+#include <ATen/ops/empty.h>
+#include <ATen/ops/zeros_like.h>
+#endif
+
+namespace at::native {
 
 Tensor conv_tbc(const Tensor& self, const Tensor& weight, const Tensor& bias, int64_t pad) {
   TORCH_CHECK(self.dim() == 3, "Input must have 3 dims: time, batch, "
@@ -39,10 +49,10 @@ Tensor conv_tbc(const Tensor& self, const Tensor& weight, const Tensor& bias, in
     weight_size[2],
   }, self.options());
   output.copy_(bias.expand(output.sizes()));
-  for (int k = 0; k < kw; k++) {
+  for (const auto k : c10::irange(kw)) {
     int iShift = std::max(0, static_cast<int>(k - real_pad));
     int oShift = std::max(0, static_cast<int>(real_pad - k));
-    int t = std::min(ilen + real_pad - k, olen) - oShift;
+    long t = std::min(ilen + real_pad - k, olen) - oShift;
     // Note: gemm assumes column-major matrices
     // input    is l*m (row-major)
     // weight   is m*r (row-major)
@@ -67,12 +77,14 @@ std::tuple<Tensor, Tensor, Tensor> conv_tbc_backward(const Tensor& dOutput, cons
   auto outputPlanes = weight_size[2];
   auto kw = weight.sizes()[0];
   auto olen = input_size[0] - kw + 1 + pad * 2;
+  // NOLINTNEXTLINE(bugprone-narrowing-conversions,cppcoreguidelines-narrowing-conversions)
   int real_pad = (olen - ilen + kw - 1) / 2;
 
   Tensor dInput = at::zeros_like(input, LEGACY_CONTIGUOUS_MEMORY_FORMAT);
   for (int k = 0; k < kw; k++) {
     int iShift = std::max(0, k - real_pad);
     int oShift = std::max(0, real_pad - k);
+    // NOLINTNEXTLINE(bugprone-narrowing-conversions,cppcoreguidelines-narrowing-conversions)
     int t = std::min(ilen + real_pad - k, olen) - oShift;
     // dOutput * T(weight) -> dInput
     if (t > 0) {
@@ -86,6 +98,7 @@ std::tuple<Tensor, Tensor, Tensor> conv_tbc_backward(const Tensor& dOutput, cons
   for (int k = 0; k < kw; k++) {
     int iShift = std::max(0, k - real_pad);
     int oShift = std::max(0, real_pad - k);
+    // NOLINTNEXTLINE(bugprone-narrowing-conversions,cppcoreguidelines-narrowing-conversions)
     int t = std::min(ilen + real_pad - k, olen) - oShift;
     // T(input) * dOutput -> dWeight
     if (t > 0) {
@@ -103,5 +116,4 @@ std::tuple<Tensor, Tensor, Tensor> conv_tbc_backward(const Tensor& dOutput, cons
   return std::make_tuple(dInput, dWeight, dBias);
 }
 
-}
-}
+} // namespace at::native

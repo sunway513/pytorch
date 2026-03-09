@@ -2,23 +2,42 @@
 
 #include <torch/csrc/jit/ir/ir.h>
 #include <torch/csrc/jit/passes/dead_code_elimination.h>
+#include <torch/csrc/jit/passes/update_differentiable_graph_requires_grad.h>
 #include <torch/csrc/jit/passes/utils/subgraph_utils.h>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 // aten and prim nodes (except FusionGroup) are guaranteed to work
 // with Autograd, other nodes (e.g. user-defined nodes) are not necessarily
 // Autograd-aware
 bool canRunWithAutograd(Node* node) {
   auto kind = node->kind();
+  for (Block* block : node->blocks()) {
+    if (!std::all_of(
+            block->nodes().begin(), block->nodes().end(), canRunWithAutograd)) {
+      return false;
+    }
+  }
   return kind != prim::FusionGroup && kind != prim::CudaFusionGroup &&
-      (kind.is_aten() || kind.is_prim());
+      kind != prim::TypeCheck && kind != prim::TensorExprGroup &&
+      kind != prim::CudaFusionGuard && kind != prim::oneDNNFusionGroup &&
+      kind != prim::oneDNNFusionGuard && (kind.is_aten() || kind.is_prim());
 }
 
 namespace {
 
 void InlineAutodiffSubgraphs(Block* block, size_t threshold);
+
+size_t blockSize(Block* block) {
+  size_t num = 0;
+  for (Node* n : block->nodes()) {
+    for (Block* b : n->blocks()) {
+      num += blockSize(b);
+    }
+    num++;
+  }
+  return num;
+}
 
 graph_node_list::iterator scanNode(Node* node, size_t threshold) {
   auto next_node = ++node->iterator();
@@ -32,9 +51,8 @@ graph_node_list::iterator scanNode(Node* node, size_t threshold) {
   }
 
   auto subgraph = node->g(attr::Subgraph);
-  int64_t subgraph_size =
-      std::distance(subgraph->nodes().begin(), subgraph->nodes().end());
-  if (subgraph_size >= static_cast<int64_t>(threshold)) {
+  size_t subgraph_size = blockSize(subgraph->block());
+  if (subgraph_size >= threshold) {
     return next_node;
   }
 
@@ -45,6 +63,11 @@ graph_node_list::iterator scanNode(Node* node, size_t threshold) {
     return next_node;
   }
 
+  // now that we inline the graph, we are no longer detaching input tensors,
+  // so the profiles will have outdated requires_grad=False.
+  // conservatively update them to maybe requiring grad, bc we might create
+  // autodiff graphs when the tensors maybe require grad
+  UpdateDifferentiableGraphRequiresGrad(subgraph, std::nullopt);
   SubgraphUtils::unmergeSubgraph(node);
   return next_node;
 }
@@ -62,5 +85,4 @@ void InlineAutodiffSubgraphs(std::shared_ptr<Graph>& graph, size_t threshold) {
   EliminateDeadCode(graph);
 }
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

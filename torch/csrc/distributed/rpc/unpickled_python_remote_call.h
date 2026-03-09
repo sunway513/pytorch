@@ -5,9 +5,7 @@
 #include <torch/csrc/distributed/rpc/unpickled_python_call.h>
 #include <torch/csrc/utils/pybind.h>
 
-namespace torch {
-namespace distributed {
-namespace rpc {
+namespace torch::distributed::rpc {
 
 // This class converts the content in a PythonRemoteCall into py::object. This
 // is a helper class to make sure that all arguments deserialization is done
@@ -21,7 +19,8 @@ class TORCH_API UnpickledPythonRemoteCall final : public UnpickledPythonCall {
   explicit UnpickledPythonRemoteCall(
       const SerializedPyObj& serializedPyObj,
       const at::IValue& retRRefId,
-      const at::IValue& retForkId);
+      const at::IValue& retForkId,
+      const bool isAsyncExecution);
 
   const RRefId& rrefId() const;
   const ForkId& forkId() const;
@@ -31,6 +30,4 @@ class TORCH_API UnpickledPythonRemoteCall final : public UnpickledPythonCall {
   ForkId forkId_;
 };
 
-} // namespace rpc
-} // namespace distributed
-} // namespace torch
+} // namespace torch::distributed::rpc

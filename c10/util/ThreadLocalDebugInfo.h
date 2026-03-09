@@ -1,11 +1,9 @@
 #pragma once
 
 #include <c10/macros/Export.h>
-#include <c10/util/Exception.h>
 
+#include <cstdint>
 #include <memory>
-#include <string>
-#include <unordered_map>
 
 namespace c10 {
 
@@ -13,6 +11,8 @@ enum class C10_API_ENUM DebugInfoKind : uint8_t {
   PRODUCER_INFO = 0,
   MOBILE_RUNTIME_INFO,
   PROFILER_STATE,
+  INFERENCE_CONTEXT, // for inference usage
+  PARAM_COMMS_INFO,
 
   TEST_INFO, // used only in tests
   TEST_INFO_2, // used only in tests
@@ -20,8 +20,8 @@ enum class C10_API_ENUM DebugInfoKind : uint8_t {
 
 class C10_API DebugInfoBase {
  public:
-  DebugInfoBase() {}
-  virtual ~DebugInfoBase() {}
+  DebugInfoBase() = default;
+  virtual ~DebugInfoBase() = default;
 };
 
 // Thread local debug information is propagated across the forward
@@ -32,20 +32,23 @@ class C10_API DebugInfoBase {
 // profiling, etc)
 class C10_API ThreadLocalDebugInfo {
  public:
-  static std::shared_ptr<DebugInfoBase> get(DebugInfoKind kind);
+  static DebugInfoBase* get(DebugInfoKind kind);
 
   // Get current ThreadLocalDebugInfo
   static std::shared_ptr<ThreadLocalDebugInfo> current();
 
   // Internal, use DebugInfoGuard/ThreadLocalStateGuard
   static void _forceCurrentDebugInfo(
-      const std::shared_ptr<ThreadLocalDebugInfo>& info);
+      std::shared_ptr<ThreadLocalDebugInfo> info);
 
   // Push debug info struct of a given kind
   static void _push(DebugInfoKind kind, std::shared_ptr<DebugInfoBase> info);
   // Pop debug info, throws in case the last pushed
   // debug info is not of a given kind
   static std::shared_ptr<DebugInfoBase> _pop(DebugInfoKind kind);
+  // Peek debug info, throws in case the last pushed debug info is not of the
+  // given kind
+  static std::shared_ptr<DebugInfoBase> _peek(DebugInfoKind kind);
 
  private:
   std::shared_ptr<DebugInfoBase> info_;
@@ -63,16 +66,16 @@ class C10_API ThreadLocalDebugInfo {
 // Users can access the values through the ThreadLocalDebugInfo::get() call;
 class C10_API DebugInfoGuard {
  public:
-  DebugInfoGuard(
-      DebugInfoKind kind, std::shared_ptr<DebugInfoBase> info);
+  DebugInfoGuard(DebugInfoKind kind, std::shared_ptr<DebugInfoBase> info);
 
-  explicit DebugInfoGuard(
-      std::shared_ptr<ThreadLocalDebugInfo> info);
+  explicit DebugInfoGuard(std::shared_ptr<ThreadLocalDebugInfo> info);
 
   ~DebugInfoGuard();
 
   DebugInfoGuard(const DebugInfoGuard&) = delete;
   DebugInfoGuard(DebugInfoGuard&&) = delete;
+  DebugInfoGuard& operator=(const DebugInfoGuard&) = delete;
+  DebugInfoGuard& operator=(DebugInfoGuard&&) = delete;
 
  private:
   bool active_ = false;

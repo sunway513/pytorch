@@ -4,14 +4,12 @@
 #include <torch/data/example.h>
 #include <torch/types.h>
 
-#include <torch/csrc/WindowsTorchApiMacro.h>
+#include <torch/csrc/Export.h>
 
 #include <cstddef>
 #include <string>
 
-namespace torch {
-namespace data {
-namespace datasets {
+namespace torch::data::datasets {
 /// The MNIST dataset.
 class TORCH_API MNIST : public Dataset<MNIST> {
  public:
@@ -28,9 +26,10 @@ class TORCH_API MNIST : public Dataset<MNIST> {
   Example<> get(size_t index) override;
 
   /// Returns the size of the dataset.
-  optional<size_t> size() const override;
+  std::optional<size_t> size() const override;
 
   /// Returns true if this is the training subset of MNIST.
+  // NOLINTNEXTLINE(bugprone-exception-escape)
   bool is_train() const noexcept;
 
   /// Returns all images stacked into a single tensor.
@@ -42,6 +41,4 @@ class TORCH_API MNIST : public Dataset<MNIST> {
  private:
   Tensor images_, targets_;
 };
-} // namespace datasets
-} // namespace data
-} // namespace torch
+} // namespace torch::data::datasets

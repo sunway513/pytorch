@@ -4,14 +4,13 @@
 #include <ATen/NamedTensorUtils.h>
 #include <ATen/TensorNames.h>
 #include <c10/util/Exception.h>
-#include <c10/util/C++17.h>
+#include <c10/util/irange.h>
 
 using at::Dimname;
 using at::DimnameList;
 using at::Symbol;
 using at::namedinference::TensorName;
 using at::namedinference::TensorNames;
-using std::make_unique;
 
 static Dimname dimnameFromString(const std::string& str) {
   return Dimname::fromSymbol(Symbol::dimname(str));
@@ -38,7 +37,7 @@ static bool dimnames_equal(at::DimnameList names, at::DimnameList other) {
   if (names.size() != other.size()) {
     return false;
   }
-  for (auto i = 0; i < names.size(); i++) {
+  for (const auto i : c10::irange(names.size())) {
     const auto& name = names[i];
     const auto& other_name = other[i];
     if (name.type() != other_name.type() || name.symbol() != other_name.symbol()) {
@@ -81,9 +80,9 @@ TEST(NamedTensorTest, internalSetNamesInplace) {
   ASSERT_TRUE(dimnames_equal(retrieved_names, names));
 
   // Drop names
-  at::internal_set_names_inplace(tensor, at::nullopt);
+  at::internal_set_names_inplace(tensor, std::nullopt);
   ASSERT_TRUE(tensor.get_named_tensor_meta() == nullptr);
-  ASSERT_TRUE(tensor.opt_names() == at::nullopt);
+  ASSERT_TRUE(tensor.opt_names() == std::nullopt);
 }
 
 TEST(NamedTensorTest, empty) {
@@ -94,14 +93,15 @@ TEST(NamedTensorTest, empty) {
   std::vector<Dimname> names = { N, C, H, W };
 
   auto tensor = at::empty({});
-  ASSERT_EQ(tensor.opt_names(), at::nullopt);
+  ASSERT_EQ(tensor.opt_names(), std::nullopt);
 
   tensor = at::empty({1, 2, 3});
-  ASSERT_EQ(tensor.opt_names(), at::nullopt);
+  ASSERT_EQ(tensor.opt_names(), std::nullopt);
 
   tensor = at::empty({1, 2, 3, 4}, names);
   ASSERT_TRUE(dimnames_equal(tensor.opt_names().value(), names));
 
+  // NOLINTNEXTLINE(hicpp-avoid-goto,cppcoreguidelines-avoid-goto)
   ASSERT_THROW(at::empty({1, 2, 3}, names), c10::Error);
 }
 
@@ -113,6 +113,7 @@ TEST(NamedTensorTest, dimnameToPosition) {
   std::vector<Dimname> names = { N, C, H, W };
 
   auto tensor = at::empty({1, 1, 1});
+  // NOLINTNEXTLINE(hicpp-avoid-goto,cppcoreguidelines-avoid-goto)
   ASSERT_THROW(dimname_to_position(tensor, N), c10::Error);
 
   tensor = at::empty({1, 1, 1, 1}, names);
@@ -145,7 +146,9 @@ static void check_unify(
 static void check_unify_error(DimnameList names, DimnameList other_names) {
   // In the future we'll merge at::unify_from_right and
   // TensorNames::unifyFromRight. For now, test them both.
+  // NOLINTNEXTLINE(hicpp-avoid-goto,cppcoreguidelines-avoid-goto)
   ASSERT_THROW(at::unify_from_right(names, other_names), c10::Error);
+  // NOLINTNEXTLINE(hicpp-avoid-goto,cppcoreguidelines-avoid-goto)
   ASSERT_THROW(tensornames_unify_from_right(names, other_names), c10::Error);
 }
 
@@ -229,8 +232,7 @@ TEST(NamedTensorTest, TensorNamesCheckUnique) {
   {
     std::vector<Dimname> nchh = { names[0], names[1], names[2], names[2] };
     auto tensornames = TensorNames(nchh);
+    // NOLINTNEXTLINE(hicpp-avoid-goto,cppcoreguidelines-avoid-goto)
     ASSERT_THROW(tensornames.checkUnique("op_name"), c10::Error);
   }
 }
-
-

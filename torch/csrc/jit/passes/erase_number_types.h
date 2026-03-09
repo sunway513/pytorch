@@ -2,8 +2,7 @@
 
 #include <torch/csrc/jit/ir/ir.h>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 // Erase NumberType information. This is necessary for and only used in
 // exporting to ONNX. This pass ensures that no remaining Values have
@@ -17,6 +16,6 @@ namespace jit {
 //
 // The pass assumes that DCE will be called sometime after.
 TORCH_API void EraseNumberTypes(const std::shared_ptr<Graph>& graph);
+TORCH_API void EraseNumberTypesOnBlock(Block* block);
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

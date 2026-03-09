@@ -61,7 +61,7 @@ CHECK` pragmas and essentially it sees the input string like this:
 ```
 
 It then checks that the optimized IR satisfies the specified annotations. It
-first finds string `%x : Tensor = aten::mul(%a, %b)` matching the annotion (1),
+first finds string `%x : Tensor = aten::mul(%a, %b)` matching the annotation (1),
 then it finds string `return (%x, %x)` matching the annotation (3), and since
 there were no lines matching `aten::mul` after the match (1) and before the
 match (3), the annotation (2) is also satisfied.
@@ -79,6 +79,9 @@ annotations from the example above one would write:
 
 * `CHECK: <pattern>`
   Scans the input until `PATTERN` is found. Fails if the pattern is not found.
+* `CHECK-NEXT: <pattern>`
+  Scans the input on the line immediately following the previous CHECK until
+  `PATTERN` is found. Fails if the pattern is not found on that line.
 * `CHECK-NOT: <pattern>`
   Scans the input and fails if `PATTERN` is found on any line. The scan stops when
   a match for a next `CHECK` is found.
@@ -90,7 +93,7 @@ annotations from the example above one would write:
 * `CHECK-COUNT-EXACTLY-<num>: <pattern>`
   Scans the input and succeeds when a line containing exactly `NUM` entries of
   `PATTERN` is found.
-* `CHECK-DAG: pattern`
+* `CHECK-DAG: <pattern>`
   Works similar to the usual `CHECK` pragma, but also matches if there exists a
   way to reorder the CHECK-DAG pragmas to satisfy all patterns.
   For example the following pattern:
@@ -107,3 +110,18 @@ annotations from the example above one would write:
   bar
   end
   ```
+* `CHECK-SOURCE-HIGHLIGHTED: <pattern>`
+  Check for highlighted source ranges. This is useful when writing tests regarding generated error messages that require source code highlighting.
+  For example the following pattern:
+  ```
+  # CHECK-SOURCE-HIGHLIGHTED: raise Exception("raised exception
+  ```
+  would match the following input:
+  ```
+  def method_that_raises() -> torch.Tensor:
+      raise Exception("raised exception")  # noqa: TRY002
+      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ <--- HERE
+  builtins.Exception: raised exception
+  ```
+* `CHECK-REGEX: <pattern>`
+  Scans the input until `PATTERN` is matched, accepts RE syntax for std::regex.

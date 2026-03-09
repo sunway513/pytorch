@@ -1,17 +1,18 @@
 #pragma once
 
-// This file provides implementations of InlineDeviceGuard and InlineOptionalDeviceGuard.
+// This file provides implementations of InlineDeviceGuard and
+// InlineOptionalDeviceGuard.
 
 #include <c10/core/Device.h>
+#include <c10/core/DeviceType.h>
 #include <c10/core/impl/DeviceGuardImplInterface.h>
 #include <c10/core/impl/VirtualGuardImpl.h>
+#include <c10/util/Exception.h>
 #include <c10/util/Optional.h>
-#include <c10/util/C++17.h>
+#include <type_traits>
+#include <utility>
 
-namespace c10 {
-namespace impl {
-
-
+namespace c10::impl {
 
 /**
  * A DeviceGuard is an RAII class that sets a device to some value
@@ -54,14 +55,14 @@ namespace impl {
  */
 template <typename T>
 class InlineDeviceGuard {
-public:
+ public:
   // Note [Omitted default constructor from RAII]
   // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   // In principle, we could add a default constructor to
   // DeviceGuard which reads the current device and promises to
   // restore to that device on exit.  However, most cases where you
   // would have written this, you probably meant to actually just
-  // use OptionalDeviceGuard (since you don't actually need the
+  // use DeviceGuard (since you don't actually need the
   // restore to happen if you don't ever actually set the device).
   // We remove the constructor here to encourage you to think about
   // what you actually want to happen.
@@ -69,25 +70,35 @@ public:
 
   /// Set the current device to the passed Device.
   explicit InlineDeviceGuard(Device device)
-    : impl_(device.type())
-    , original_device_(device.index() == -1 ? impl_.getDevice() : impl_.exchangeDevice(device))
-    , current_device_(device.index() == -1 ? original_device_ : device)
-    {}
+      : impl_(device.type()),
+        original_device_(
+            device.index() == -1 ? impl_.getDevice()
+                                 : impl_.exchangeDevice(device)),
+        current_device_(device.index() == -1 ? original_device_ : device) {}
 
   /// Set the current device index to the passed DeviceIndex.  (The
   /// device type is inferred from the template parameter T).
-  template <typename U=T, typename=typename std::enable_if<!std::is_same<U, VirtualGuardImpl>::value>::type>
+  template <
+      typename U = T,
+      typename =
+          typename std::enable_if_t<!std::is_same_v<U, VirtualGuardImpl>>>
   explicit InlineDeviceGuard(DeviceIndex device_index)
-    : InlineDeviceGuard(Device(U::static_type, device_index)) {}
+      : InlineDeviceGuard(Device(U::static_type, device_index)) {}
 
   /// Construct an InlineDeviceGuard using VirtualGuardImpl with an explicit
   /// DeviceGuardImplInterface pointer.
-  template <typename U=T, typename=typename std::enable_if<std::is_same<U, VirtualGuardImpl>::value>::type>
-  explicit InlineDeviceGuard(Device device, const DeviceGuardImplInterface* impl)
-    : impl_(VirtualGuardImpl(impl ? impl : getDeviceGuardImpl(device.type())))
-    , original_device_(device.index() == -1 ? impl_.getDevice() : impl_.exchangeDevice(device))
-    , current_device_(device.index() == -1 ? original_device_ : device)
-    {}
+  template <
+      typename U = T,
+      typename = typename std::enable_if_t<std::is_same_v<U, VirtualGuardImpl>>>
+  explicit InlineDeviceGuard(
+      Device device,
+      const DeviceGuardImplInterface* impl)
+      : impl_(
+            VirtualGuardImpl(impl ? impl : getDeviceGuardImpl(device.type()))),
+        original_device_(
+            device.index() == -1 ? impl_.getDevice()
+                                 : impl_.exchangeDevice(device)),
+        current_device_(device.index() == -1 ? original_device_ : device) {}
 
   /// Copy is disallowed
   InlineDeviceGuard(const InlineDeviceGuard<T>&) = delete;
@@ -103,12 +114,16 @@ public:
   }
 
   /// Sets the device to the given one.
-  template <typename U=T, typename std::enable_if<!std::is_same<U, VirtualGuardImpl>::value, int>::type = 0>
+  template <
+      typename U = T,
+      typename std::enable_if_t<!std::is_same_v<U, VirtualGuardImpl>, int> = 0>
   void set_device(at::Device device) {
-    AT_ASSERT((U::static_type == DeviceType::HIP && device.type() == DeviceType::CUDA) ||
-              device.type() == U::static_type);
+    AT_ASSERT(
+        (U::static_type == DeviceType::HIP && device.is_cuda()) ||
+        device.type() == U::static_type);
     auto index = device.index();
-    if (index == -1) return;
+    if (index == -1)
+      return;
     impl_.setDevice(device);
     current_device_ = device;
   }
@@ -116,9 +131,9 @@ public:
   /// Resets the currently set device to its original device, and then sets the
   /// current device to the passed device.  This is effectively equivalent to
   /// set_device when a guard supports only a single device type.
-  template <typename U=T>
-  typename std::enable_if<!std::is_same<U, VirtualGuardImpl>::value >::type
-  reset_device(at::Device device) {
+  template <typename U = T>
+  typename std::enable_if_t<!std::is_same_v<U, VirtualGuardImpl>> reset_device(
+      at::Device device) {
     set_device(device);
   }
 
@@ -139,11 +154,13 @@ public:
   /// that it is unnecessary.
   ///
   /// Optional argument is for testing only.
-  template <typename U=T>
-  typename std::enable_if<std::is_same<U, VirtualGuardImpl>::value >::type
-  reset_device(at::Device device, const impl::DeviceGuardImplInterface* impl = nullptr) {
+  template <typename U = T>
+  typename std::enable_if_t<std::is_same_v<U, VirtualGuardImpl>> reset_device(
+      at::Device device,
+      const impl::DeviceGuardImplInterface* impl = nullptr) {
     auto index = device.index();
-    if (index == -1) return;
+    if (index == -1)
+      return;
     if (device.type() == original_device_.type()) {
       AT_ASSERT(impl == nullptr || impl->type() == device.type());
       impl_.setDevice(device);
@@ -175,10 +192,10 @@ public:
     return current_device_;
   }
 
-protected:
+ protected:
   T impl_;
 
-private:
+ private:
   Device original_device_;
   Device current_device_;
 };
@@ -193,29 +210,35 @@ private:
  */
 template <typename T>
 class InlineOptionalDeviceGuard {
-public:
+ public:
   // Note [Explicit initialization of optional fields]
   // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
   // Explicit initialization of optional fields
-  // required to workaround an nvcc bug; see https://github.com/pytorch/pytorch/issues/12117
+  // required to workaround an nvcc bug; see
+  // https://github.com/pytorch/pytorch/issues/12117
 
   /// Creates an uninitialized OptionalDeviceGuard.
   explicit InlineOptionalDeviceGuard()
-    : guard_() // See Note [Explicit initialization of optional fields]
-    {}
+      : guard_() // See Note [Explicit initialization of optional fields]
+  {}
+  ~InlineOptionalDeviceGuard() = default;
 
   /// Set the current device to the passed Device, if it is not nullopt.
-  explicit InlineOptionalDeviceGuard(optional<Device> device_opt)
-    : guard_() { // See Note [Explicit initialization of optional fields]
+  explicit InlineOptionalDeviceGuard(std::optional<Device> device_opt)
+      : guard_() { // See Note [Explicit initialization of optional fields]
     if (device_opt.has_value()) {
       guard_.emplace(device_opt.value());
     }
   }
 
   /// Set the current device to the passed DeviceIndex, if it is not nullopt.
-  template <typename U=T, typename=typename std::enable_if<!std::is_same<U, VirtualGuardImpl>::value>::type>
-  explicit InlineOptionalDeviceGuard(optional<DeviceIndex> device_index_opt)
-    : guard_() { // See Note [Explicit initialization of optional fields]
+  template <
+      typename U = T,
+      typename =
+          typename std::enable_if_t<!std::is_same_v<U, VirtualGuardImpl>>>
+  explicit InlineOptionalDeviceGuard(
+      std::optional<DeviceIndex> device_index_opt)
+      : guard_() { // See Note [Explicit initialization of optional fields]
     if (device_index_opt.has_value()) {
       guard_.emplace(device_index_opt.value());
     }
@@ -225,9 +248,9 @@ public:
   /// and result in initialized OptionalDeviceGuard.
   template <typename... Args>
   explicit InlineOptionalDeviceGuard(Args&&... args)
-    : guard_(in_place, std::forward<Args>(args)...) {}
+      : guard_(std::in_place, std::forward<Args>(args)...) {}
 
-  // TODO: Consider readding Tensor and TensorList constructors here, when
+  // TODO: Consider reading Tensor and TensorList constructors here, when
   // Tensor moves to c10.  (These are only valid on OptionalDeviceGuard,
   // because a Tensor may be undefined, in which case we need an uninitialized
   // tensor guard.)
@@ -264,6 +287,7 @@ public:
   // It's in principle possible to raise an error when this occurs
   // by doing some extra thread-local bookkeeping.  But why bother?
   // Just don't provide the constructor.
+  InlineOptionalDeviceGuard(const InlineOptionalDeviceGuard<T>& other) = delete;
   InlineOptionalDeviceGuard(InlineOptionalDeviceGuard<T>&& other) = delete;
 
   // Note [Move assignment for RAII guards is tricky]
@@ -313,11 +337,17 @@ public:
   //
   // We could solve this with an extra thread-local variable.  But no one is
   // actually using move-assignment.  So just get rid of it.
-  InlineOptionalDeviceGuard& operator=(InlineOptionalDeviceGuard&& other) = delete;
+  InlineOptionalDeviceGuard& operator=(const InlineOptionalDeviceGuard& other) =
+      delete;
+  InlineOptionalDeviceGuard& operator=(InlineOptionalDeviceGuard&& other) =
+      delete;
 
   /// Sets the device to the given one.  Initializes OptionalDeviceGuard if it
   /// is not already initialized.
-  template <typename U=T, typename=typename std::enable_if<!std::is_same<U, VirtualGuardImpl>::value>::type>
+  template <
+      typename U = T,
+      typename =
+          typename std::enable_if_t<!std::is_same_v<U, VirtualGuardImpl>>>
   void set_device(at::Device device) {
     if (!guard_.has_value()) {
       guard_.emplace(device);
@@ -333,8 +363,12 @@ public:
   /// See notes on why this is called reset_device on InlineDeviceGuard.
   ///
   /// Optional argument is for testing only.
-  template <typename U=T, typename=typename std::enable_if<std::is_same<U, VirtualGuardImpl>::value>::type>
-  void reset_device(at::Device device, const DeviceGuardImplInterface* impl = nullptr) {
+  template <
+      typename U = T,
+      typename = typename std::enable_if_t<std::is_same_v<U, VirtualGuardImpl>>>
+  void reset_device(
+      at::Device device,
+      const DeviceGuardImplInterface* impl = nullptr) {
     if (!guard_.has_value()) {
       guard_.emplace(device, impl);
     } else {
@@ -346,7 +380,10 @@ public:
   /// current device to the passed device.  Initializes the guard if it is
   /// not already initialized.  This is effectively equivalent to set_device
   /// when a guard supports only a single device type.
-  template <typename U=T, typename=typename std::enable_if<!std::is_same<U, VirtualGuardImpl>::value>::type>
+  template <
+      typename U = T,
+      typename =
+          typename std::enable_if_t<!std::is_same_v<U, VirtualGuardImpl>>>
   void reset_device(at::Device device) {
     if (!guard_.has_value()) {
       guard_.emplace(device);
@@ -357,7 +394,10 @@ public:
 
   /// Sets the device index to the given one.  The device type is statically
   /// known.
-  template <typename U=T, typename=typename std::enable_if<!std::is_same<U, VirtualGuardImpl>::value >::type>
+  template <
+      typename U = T,
+      typename =
+          typename std::enable_if_t<!std::is_same_v<U, VirtualGuardImpl>>>
   void set_index(DeviceIndex index) {
     if (!guard_.has_value()) {
       guard_.emplace(index);
@@ -366,17 +406,19 @@ public:
     }
   }
 
-  /// Returns the device that was set immediately prior to initialization of the,
-  /// guard, or nullopt if the guard is uninitialized.
-  optional<Device> original_device() const {
-    return guard_.has_value() ? make_optional(guard_->original_device()) : nullopt;
+  /// Returns the device that was set immediately prior to initialization of
+  /// the, guard, or nullopt if the guard is uninitialized.
+  std::optional<Device> original_device() const {
+    return guard_.has_value() ? std::make_optional(guard_->original_device())
+                              : std::nullopt;
   }
 
   /// Returns the most recent device that was set using this device guard,
   /// either from construction, or via set_device, if the guard is initialized,
   /// or nullopt if the guard is uninitialized.
-  optional<Device> current_device() const {
-    return guard_.has_value() ? make_optional(guard_->current_device()) : nullopt;
+  std::optional<Device> current_device() const {
+    return guard_.has_value() ? std::make_optional(guard_->current_device())
+                              : std::nullopt;
   }
 
   /// Restore the original device, resetting this guard to uninitialized state.
@@ -384,8 +426,8 @@ public:
     guard_.reset();
   }
 
-private:
-  optional<InlineDeviceGuard<T>> guard_;
+ private:
+  std::optional<InlineDeviceGuard<T>> guard_;
 };
 
-}} // namespace c10::impl
+} // namespace c10::impl

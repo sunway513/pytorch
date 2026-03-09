@@ -4,8 +4,7 @@
 #include <ATen/core/stack.h>
 #include <torch/csrc/jit/runtime/operator.h>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 /// Registration class for new operators. Effectively calls
 /// `torch::jit::registerOperator` for every supplied operator, but allows doing
@@ -17,12 +16,15 @@ struct TORCH_API RegisterOperators {
   RegisterOperators() = default;
 
   /// Registers a vector of already created `Operator`s.
-  RegisterOperators(std::vector<Operator> operators) {
-    for (Operator& o : operators) {
-      registerOperator(std::move(o));
+  /// The operator element is now optional to filter null ops. It's backward
+  /// compatible and works for selective operator registration.
+  explicit RegisterOperators(std::vector<std::optional<Operator>> operators) {
+    for (std::optional<Operator>& o : operators) {
+      if (o) {
+        registerOperator(std::move(o.value()));
+      }
     }
   }
 };
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

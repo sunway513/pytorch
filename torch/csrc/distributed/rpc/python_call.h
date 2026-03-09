@@ -3,30 +3,27 @@
 #include <torch/csrc/distributed/rpc/rpc_command_base.h>
 #include <torch/csrc/distributed/rpc/types.h>
 
-namespace torch {
-namespace distributed {
-namespace rpc {
+namespace torch::distributed::rpc {
 
 // RPC call representing calling a Python function over RPC.
 class TORCH_API PythonCall final : public RpcCommandBase {
  public:
-  PythonCall(SerializedPyObj&& serializedPyObj, bool isAsyncFunction_);
+  PythonCall(SerializedPyObj&& serializedPyObj, bool isAsyncExecution);
 
-  Message toMessageImpl() && override;
+  c10::intrusive_ptr<Message> toMessageImpl() && override;
 
   static std::unique_ptr<PythonCall> fromMessage(const Message& message);
 
   const SerializedPyObj& serializedPyObj() const;
 
-  inline bool isAsyncFunction() const {
-    return isAsyncFunction_;
+  inline bool isAsyncExecution() const {
+    return isAsyncExecution_;
   }
 
  private:
   SerializedPyObj serializedPyObj_;
-  const bool isAsyncFunction_;
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members)
+  const bool isAsyncExecution_;
 };
 
-} // namespace rpc
-} // namespace distributed
-} // namespace torch
+} // namespace torch::distributed::rpc

@@ -1,9 +1,12 @@
 #include <torch/csrc/jit/passes/utils/check_alias_annotation.h>
+
 #include <torch/csrc/jit/passes/constant_propagation.h>
+#include <torch/csrc/jit/passes/normalize_ops.h>
 #include <torch/csrc/jit/runtime/operator.h>
 
-namespace torch {
-namespace jit {
+#include <c10/util/irange.h>
+
+namespace torch::jit {
 namespace {
 
 IValue deepCopy(const IValue& self) {
@@ -16,17 +19,10 @@ IValue deepCopy(const IValue& self) {
   if (self.isTensor()) {
     return IValue(self.toTensor().clone(at::MemoryFormat::Preserve));
   }
-  if (self.isTensorList()) {
-    c10::List<at::Tensor> newList;
-    for (const at::Tensor& oldTensor : self.toTensorVector()) {
-      newList.push_back(oldTensor.clone(at::MemoryFormat::Preserve));
-    }
-    return newList;
-  }
 
   // Lists of ivalues should recursively deep copy their contents
   if (self.isList()) {
-    auto source = std::move(self).toList();
+    auto source = self.toList();
     auto newList = c10::impl::GenericList(source.elementType());
     newList.reserve(source.size());
     for (const IValue& value : source) {
@@ -40,6 +36,8 @@ IValue deepCopy(const IValue& self) {
     return IValue(self.toIntList().copy());
   } else if (self.isDoubleList()) {
     return IValue(self.toDoubleList().copy());
+  } else if (self.isComplexDoubleList()) {
+    return IValue(self.toComplexDoubleList().copy());
   } else if (self.isBoolList()) {
     return IValue(self.toBoolList().copy());
   } else if (self.isString()) {
@@ -61,33 +59,39 @@ Stack deepCopy(const Stack& stack) {
 }
 
 bool deepEquals(const IValue& lhs, const IValue& rhs) {
-  if (lhs.isInt() && rhs.isInt()) {
-    return lhs.toInt() == rhs.toInt();
-  } else if (lhs.isDouble() && rhs.isDouble()) {
-    return lhs.toDouble() == rhs.toDouble();
-  } else if (lhs.isNone() && rhs.isNone()) {
-    return true;
-  } else if (lhs.isIntList() && rhs.isIntList()) {
-    return lhs.toIntVector() == rhs.toIntVector();
-  } else if (lhs.isTensor() && rhs.isTensor()) {
+  if (lhs.isTensor() && rhs.isTensor()) {
     return lhs.toTensor().equal(rhs.toTensor());
   }
 
-  throw std::runtime_error("Deep equals not implemented for type");
+  if (lhs.isTensorList() && rhs.isTensorList()) {
+    const auto a = lhs.toTensorList();
+    const auto b = rhs.toTensorList();
+    if (a.size() != b.size()) {
+      return false;
+    }
+    for (auto i = decltype(a.size()){0}; i < a.size(); ++i) {
+      if (!a[i].equal(b[i])) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  return lhs == rhs;
 }
 
 struct AliasAndIValue {
-  AliasAndIValue(c10::optional<at::AliasInfo> aliasInfo, IValue iValue)
-      : aliasInfo(std::move(aliasInfo)), iValue(std::move(iValue)) {}
+  AliasAndIValue(const at::AliasInfo* aliasInfo, IValue iValue)
+      : aliasInfo(aliasInfo), iValue(std::move(iValue)) {}
 
-  const c10::optional<at::AliasInfo> aliasInfo;
+  const at::AliasInfo* aliasInfo;
   const IValue iValue;
 };
 
 // No inputs should alias each other
 void checkInputPreconditions(const Stack& inputs) {
-  for (size_t i = 0; i < inputs.size(); i++) {
-    for (size_t j = 0; j < inputs.size(); j++) {
+  for (const auto i : c10::irange(inputs.size())) {
+    for (const auto j : c10::irange(inputs.size())) {
       if (i == j) {
         continue;
       }
@@ -106,8 +110,8 @@ void checkAliases(
     // if this output aliases any input, make sure that they share an alias set
     for (const auto& input : inputs) {
       if (output.iValue.isAliasOf(input.iValue)) {
-        const auto inputSet = input.aliasInfo;
-        const auto outputSet = output.aliasInfo;
+        const auto* inputSet = input.aliasInfo;
+        const auto* outputSet = output.aliasInfo;
         AT_ASSERT(inputSet && outputSet);
         bool found = false;
         for (const auto& set : inputSet->beforeSets()) {
@@ -128,7 +132,7 @@ void checkWrites(
     const std::vector<AliasAndIValue>& inputs,
     const std::vector<IValue>& deepCopiedInputs) {
   AT_ASSERT(inputs.size() == deepCopiedInputs.size());
-  for (size_t i = 0; i < inputs.size(); i++) {
+  for (const auto i : c10::irange(inputs.size())) {
     const auto& input = inputs[i];
     const auto& deepCopiedInput = deepCopiedInputs[i];
     if (!input.aliasInfo || !input.aliasInfo->isWrite()) {
@@ -141,18 +145,47 @@ const Node* findNodeForOp(
     const Graph& g,
     const std::string& unqualifiedOpName) {
   const auto opName = Symbol::fromQualString("aten::" + unqualifiedOpName);
-  for (const auto node : g.nodes()) {
+  for (const auto* node : g.nodes()) {
     if (node->kind() == opName) {
       return node;
     }
   }
+
+  // Check for alias-ed operator names
+  const auto aliasOp = torch::jit::getOperatorAliasMap().find(opName);
+  if (aliasOp != torch::jit::getOperatorAliasMap().end()) {
+    for (const auto* node : g.nodes()) {
+      if (node->kind() == aliasOp->second) {
+        return node;
+      }
+    }
+  }
+
+  // Ideally, there will be only one ATen operator that has tensor outputs in
+  // the graph. Let's use that as the last resolve to make checkAliasAnnotation
+  // more robust.
+  for (const auto* node : g.nodes()) {
+    if (!node->maybeOperator()) {
+      continue;
+    }
+    if (!node->getOperator().isC10Op()) {
+      continue;
+    }
+
+    for (const auto* output : node->outputs()) {
+      if (output->type()->kind() == TypeKind::TensorType) {
+        return node;
+      }
+    }
+  }
+
   AT_ASSERT(false);
 }
 
 // Handle a few special cases where we need to propagate constants
 // manually
 // TODO(suo): we should be able to move this stuff to constant prop
-c10::optional<IValue> toIValueProp(const Value* v) {
+std::optional<IValue> toIValueProp(const Value* v) {
   if (v->node()->kind() == prim::ListConstruct) {
     std::vector<IValue> genericList;
     for (auto input : v->node()->inputs()) {
@@ -160,7 +193,7 @@ c10::optional<IValue> toIValueProp(const Value* v) {
         genericList.push_back(*elem);
       } else {
         // One of the list elements isn't constant.
-        return c10::nullopt;
+        return std::nullopt;
       }
     }
 
@@ -173,11 +206,11 @@ c10::optional<IValue> toIValueProp(const Value* v) {
     } else if (containedType == FloatType::get()) {
       return IValue(
           fmap(genericList, [](const IValue& v) { return v.toDouble(); }));
-    } else if (containedType->isSubtypeOf(TensorType::get())) {
+    } else if (containedType->isSubtypeOf(*TensorType::get())) {
       return IValue(
           fmap(genericList, [](const IValue& v) { return v.toTensor(); }));
     } else {
-      return c10::nullopt;
+      return std::nullopt;
     }
   }
 
@@ -186,7 +219,22 @@ c10::optional<IValue> toIValueProp(const Value* v) {
       return maybe_stack->at(0);
     }
   }
-  return c10::nullopt;
+  return std::nullopt;
+}
+
+// batch_norm and instance_norm have incorrect annotations, because
+// (a!)? annotations aren't supported, so these checks would fail.
+// Their behavior also varies depending on the `training` and
+// `use_input_stats` arguments.
+// There are custom implementations in alias_analysis.cpp for these ops.
+bool shouldIgnoreNode(const Node* n) {
+  switch (n->kind()) {
+    case aten::batch_norm:
+    case aten::instance_norm:
+      return true;
+    default:
+      return false;
+  }
 }
 } // namespace
 
@@ -196,6 +244,9 @@ void checkAliasAnnotation(
     const std::string& unqualifiedOpName) {
   // Find the node that corresponds to our op name
   const auto node = findNodeForOp(*graph, unqualifiedOpName);
+  if (shouldIgnoreNode(node)) {
+    return;
+  }
 
   // Build the stack to use as input to the op
   Stack stack;
@@ -223,10 +274,10 @@ void checkAliasAnnotation(
   // it was created by the op.
   checkInputPreconditions(stack);
 
-  const auto schema = node->schema();
+  const auto& schema = node->schema();
 
   std::vector<AliasAndIValue> inputsToCheck;
-  for (size_t i = 0; i < schema.arguments().size(); i++) {
+  for (const auto i : c10::irange(schema.arguments().size())) {
     inputsToCheck.emplace_back(
         schema.arguments().at(i).alias_info(), stack.at(i));
   }
@@ -241,7 +292,7 @@ void checkAliasAnnotation(
   const auto outputs = std::move(stack);
 
   std::vector<AliasAndIValue> outputsToCheck;
-  for (size_t i = 0; i < schema.returns().size(); i++) {
+  for (const auto i : c10::irange(schema.returns().size())) {
     outputsToCheck.emplace_back(
         schema.returns().at(i).alias_info(), outputs.at(i));
   }
@@ -253,5 +304,4 @@ void checkAliasAnnotation(
   checkWrites(inputsToCheck, inputsDeepCopy);
 }
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

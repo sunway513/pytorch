@@ -11,6 +11,13 @@
 }
 
 {
+   ignore_empty_generic_uninitialised_conditional_jump
+   Memcheck:Cond
+   fun:_ZN2at6detail13empty_genericEN3c108ArrayRefIlEEPNS1_9AllocatorENS1_14DispatchKeySetENS1_10ScalarTypeESt8optionalINS1_12MemoryFormatEE
+   ...
+}
+
+{
    Cond_cuda
    Memcheck:Cond
    obj:*libcuda.so*
@@ -20,6 +27,15 @@
 {
    Value8_cuda
    Memcheck:Value8
+   obj:*libcuda.so*
+   ...
+}
+
+{
+   ignore_cuda_ioctl_param_points_to_uninitialised_bytes
+   Memcheck:Param
+   ioctl(generic)
+   fun:ioctl
    obj:*libcuda.so*
    ...
 }

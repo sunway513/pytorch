@@ -1,10 +1,42 @@
+#include <c10/util/DeadlockDetection.h>
 #include <torch/csrc/distributed/rpc/rpc_agent.h>
 
-namespace torch {
-namespace distributed {
-namespace rpc {
+namespace torch::distributed::rpc {
 
-constexpr size_t WorkerInfo::MAX_NAME_LEN;
+RegisterWorkerInfoOnce::RegisterWorkerInfoOnce() {
+  // WorkerInfo needs to be registered exactly once. Since the op registration
+  // happens in libtorch_python we wrap the class registration in a helper to
+  // make sure that if there's multiple copies of Python such as used in
+  // torch::deploy we only ever register it once.
+  static auto workerInfo = torch::class_<WorkerInfo>("dist_rpc", "WorkerInfo")
+                               .def(torch::init<std::string, int64_t>());
+}
+
+WorkerInfo::WorkerInfo(std::string name, int64_t id)
+    : WorkerInfo(std::move(name), static_cast<worker_id_t>(id)) {
+  TORCH_CHECK(
+      id <= std::numeric_limits<worker_id_t>::max(),
+      "RPC worker id ",
+      id,
+      " out of bound of int16_t.");
+}
+
+WorkerInfo::WorkerInfo(std::string name, worker_id_t id)
+    : name_(std::move(name)), id_(id) {
+  bool validSize = name_.length() < MAX_NAME_LEN && !name_.empty();
+  bool validChar =
+      std::find_if(name_.begin(), name_.end(), [](char c) {
+        return !(std::isalnum(c) || c == '-' || c == '_' || c == ':');
+      }) == name_.end();
+  TORCH_CHECK(
+      validSize && validChar,
+      "Worker name must match ^[A-Za-z0-9-_:]*$, "
+      "and must be non-empty and shorter than ",
+      MAX_NAME_LEN,
+      " chars, "
+      "but got ",
+      name_);
+}
 
 // Large Time Duration for waiting on the condition variable until the map is
 // population. Cannot use
@@ -35,6 +67,7 @@ void RpcAgent::start() {
 }
 
 void RpcAgent::shutdown() {
+  TORCH_ASSERT_NO_GIL_WITHOUT_PYTHON_DEP();
   std::unique_lock<std::mutex> lock(rpcRetryMutex_);
   rpcAgentRunning_.store(false);
   lock.unlock();
@@ -42,12 +75,13 @@ void RpcAgent::shutdown() {
   if (rpcRetryThread_.joinable()) {
     rpcRetryThread_.join();
   }
+  // NOLINTNEXTLINE(clang-analyzer-cplusplus.PureVirtualCall)
   shutdownImpl();
 }
 
-std::shared_ptr<FutureMessage> RpcAgent::sendWithRetries(
+c10::intrusive_ptr<JitFuture> RpcAgent::sendWithRetries(
     const WorkerInfo& to,
-    Message&& message,
+    c10::intrusive_ptr<Message> message,
     RpcRetryOptions retryOptions) {
   TORCH_CHECK(retryOptions.maxRetries >= 0, "maxRetries cannot be negative.");
   TORCH_CHECK(
@@ -57,26 +91,19 @@ std::shared_ptr<FutureMessage> RpcAgent::sendWithRetries(
       retryOptions.rpcRetryDuration.count() >= 0,
       "rpcRetryDuration cannot be negative.");
 
-  auto originalFuture = std::make_shared<FutureMessage>();
+  auto originalFuture =
+      c10::make_intrusive<JitFuture>(at::AnyClassType::get(), getDevices());
   steady_clock_time_point newTime =
       computeNewRpcRetryTime(retryOptions, /* retryCount */ 0);
-  // Making a copy of the message so it can be retried after the first send.
-  Message msgCopy = message;
-  auto fm = send(to, std::move(message));
   auto firstRetryRpc = std::make_shared<RpcRetryInfo>(
       to,
-      std::move(msgCopy),
+      message,
       originalFuture,
       /* retryCount */ 0,
       retryOptions);
-  // Use weak_ptr so that the value can be std::moved in rpcRetryCallback.
-  fm->addCallback([this,
-                   newTime,
-                   firstRetryRpc,
-                   weak = std::weak_ptr<FutureMessage>(fm)]() {
-    auto fm = weak.lock();
-    TORCH_INTERNAL_ASSERT(fm);
-    rpcRetryCallback(fm, newTime, firstRetryRpc);
+  auto jitFuture = send(to, std::move(message));
+  jitFuture->addCallback([this, newTime, firstRetryRpc](JitFuture& future) {
+    rpcRetryCallback(future, newTime, firstRetryRpc);
   });
 
   return originalFuture;
@@ -85,10 +112,10 @@ std::shared_ptr<FutureMessage> RpcAgent::sendWithRetries(
 void RpcAgent::retryExpiredRpcs() {
   // Stores the retried futures so callbacks can be added outside the lock.
   std::vector<
-      std::pair<std::shared_ptr<FutureMessage>, std::shared_ptr<RpcRetryInfo>>>
+      std::pair<c10::intrusive_ptr<JitFuture>, std::shared_ptr<RpcRetryInfo>>>
       futures;
   // Stores futures and exception messages for non-retriable error-ed futures.
-  std::vector<std::pair<std::shared_ptr<FutureMessage>, std::string>>
+  std::vector<std::pair<c10::intrusive_ptr<JitFuture>, std::string>>
       errorFutures;
 
   while (rpcAgentRunning_.load()) {
@@ -124,17 +151,15 @@ void RpcAgent::retryExpiredRpcs() {
     for (auto it = earliestRpcList.begin(); it != earliestRpcList.end();
          /* no increment */) {
       auto& earliestRpc = *it;
-      // Making a copy of the message so it can be retried in the future.
-      Message msgCopy = earliestRpc->message_;
-      std::shared_ptr<FutureMessage> fm;
+      c10::intrusive_ptr<JitFuture> jitFuture;
 
       // send() will throw an exception if an RPC is retried while the agent is
       // shutdown. We must catch this exception and mark the original future
       // with an error, since this RPC never succeeded and can no longer be
       // retried.
       try {
-        fm = send(earliestRpc->to_, std::move(msgCopy));
-        futures.emplace_back(fm, earliestRpc);
+        jitFuture = send(earliestRpc->to_, earliestRpc->message_);
+        futures.emplace_back(jitFuture, earliestRpc);
       } catch (std::exception& e) {
         // We must store the futures and exception messages here and only mark
         // the futures with an error after releasing the lock.
@@ -149,7 +174,7 @@ void RpcAgent::retryExpiredRpcs() {
     }
 
     // If there are no more RPC's set to be retried at the current timepoint,
-    // we can remove the corresponsing unordered_set from the retry map.
+    // we can remove the corresponding unordered_set from the retry map.
     if (earliestRpcList.empty()) {
       rpcRetryMap_.erase(earliestTimeout);
     }
@@ -158,20 +183,14 @@ void RpcAgent::retryExpiredRpcs() {
     // We attach callbacks to the futures outside of the lock to prevent
     // potential deadlocks.
     for (const auto& it : futures) {
-      auto fm = it.first;
+      auto jitFuture = it.first;
       auto earliestRpc = it.second;
       steady_clock_time_point newTime = computeNewRpcRetryTime(
           earliestRpc->options_, earliestRpc->retryCount_);
       earliestRpc->retryCount_++;
 
-      // Use weak_ptr so that the value can be std::moved in rpcRetryCallback.
-      fm->addCallback([this,
-                       newTime,
-                       earliestRpc,
-                       weak = std::weak_ptr<FutureMessage>(fm)]() {
-        auto fm = weak.lock();
-        TORCH_INTERNAL_ASSERT(fm);
-        rpcRetryCallback(fm, newTime, earliestRpc);
+      jitFuture->addCallback([this, newTime, earliestRpc](JitFuture& future) {
+        rpcRetryCallback(future, newTime, earliestRpc);
       });
     }
     futures.clear();
@@ -181,17 +200,18 @@ void RpcAgent::retryExpiredRpcs() {
     for (const auto& it : errorFutures) {
       auto errorFuture = it.first;
       auto errorMsg = it.second;
-      errorFuture->setError(errorMsg);
+      errorFuture->setError(
+          std::make_exception_ptr(std::runtime_error(errorMsg)));
     }
     errorFutures.clear();
   }
 }
 
 void RpcAgent::rpcRetryCallback(
-    const std::shared_ptr<FutureMessage>& futureMessage,
+    JitFuture& jitFuture,
     steady_clock_time_point newTime,
     std::shared_ptr<RpcRetryInfo> earliestRpc) {
-  if (futureMessage->hasError()) {
+  if (jitFuture.hasError()) {
     // Adding one since we want to include the original send as well and not
     // just the retry count.
     LOG(INFO) << "Send try " << (earliestRpc->retryCount_ + 1) << " failed";
@@ -199,11 +219,7 @@ void RpcAgent::rpcRetryCallback(
       // If the RPC Agent has shutdown, we cannot retry messages. Thus we mark
       // the future with an error since the RPC was never completed
       // successfully.
-      std::string errorMessage = c10::str(
-          "RPC Agent is no longer running on Node ",
-          RpcAgent::getWorkerInfo().id_,
-          ". Cannot retry message.");
-      earliestRpc->originalFuture_->setError(*futureMessage->error());
+      earliestRpc->originalFuture_->setError(jitFuture.exception_ptr());
     } else if (earliestRpc->retryCount_ < earliestRpc->options_.maxRetries) {
       // If the previous future completed with an error and we haven't
       // completed maxRetries send attempts, we move the earliestRpc
@@ -223,12 +239,13 @@ void RpcAgent::rpcRetryCallback(
           "The RPC has not succeeded after the specified number of max retries (",
           earliestRpc->options_.maxRetries,
           ").");
-      earliestRpc->originalFuture_->setError(errorMessage);
+      earliestRpc->originalFuture_->setError(
+          std::make_exception_ptr(std::runtime_error(errorMessage)));
     }
   } else {
     // This try succeeded, so we can make the original future as complete.
     earliestRpc->originalFuture_->markCompleted(
-        std::move(*futureMessage).moveValue());
+        jitFuture.value(), jitFuture.storages());
   }
 }
 
@@ -239,21 +256,37 @@ const WorkerInfo& RpcAgent::getWorkerInfo() const {
 std::shared_ptr<RpcAgent> RpcAgent::currentRpcAgent_ = nullptr;
 
 bool RpcAgent::isCurrentRpcAgentSet() {
-  return currentRpcAgent_ != nullptr;
+  return std::atomic_load(&currentRpcAgent_) != nullptr;
 }
 
 std::shared_ptr<RpcAgent> RpcAgent::getCurrentRpcAgent() {
-  TORCH_INTERNAL_ASSERT(currentRpcAgent_, "Current RPC agent is not set!");
-  return currentRpcAgent_;
+  std::shared_ptr<RpcAgent> agent = std::atomic_load(&currentRpcAgent_);
+  TORCH_CHECK(
+      agent,
+      "Current RPC agent is not set! Did you initialize the RPC "
+      "framework (e.g. by calling `rpc.init_rpc`)?");
+  return agent;
 }
 
 void RpcAgent::setCurrentRpcAgent(std::shared_ptr<RpcAgent> rpcAgent) {
   if (rpcAgent) {
-    TORCH_INTERNAL_ASSERT(!currentRpcAgent_, "Current RPC agent is set!");
+    std::shared_ptr<RpcAgent> previousAgent;
+    // Use compare_exchange so that we don't actually perform the exchange if
+    // that would trigger the assert just below. See:
+    // https://en.cppreference.com/w/cpp/atomic/atomic_compare_exchange
+    std::atomic_compare_exchange_strong(
+        &currentRpcAgent_, &previousAgent, std::move(rpcAgent));
+    TORCH_INTERNAL_ASSERT(
+        previousAgent == nullptr, "Current RPC agent is set!");
   } else {
-    TORCH_INTERNAL_ASSERT(currentRpcAgent_, "Current RPC agent is not set!");
+    // We can't use compare_exchange (we don't know what value to expect) but we
+    // don't need to, as the only case that would trigger the assert is if we
+    // replaced nullptr with nullptr, which we can just do as it has no effect.
+    std::shared_ptr<RpcAgent> previousAgent =
+        std::atomic_exchange(&currentRpcAgent_, std::move(rpcAgent));
+    TORCH_INTERNAL_ASSERT(
+        previousAgent != nullptr, "Current RPC agent is not set!");
   }
-  currentRpcAgent_ = std::move(rpcAgent);
 }
 
 void RpcAgent::setTypeResolver(std::shared_ptr<TypeResolver> typeResolver) {
@@ -273,6 +306,17 @@ bool RpcAgent::isGILProfilingEnabled() {
   return profilingEnabled_.load();
 }
 
+DeviceMap RpcAgent::getDeviceMap(const WorkerInfo& /* unused */) const {
+  // Default implementation has no device map.
+  return {};
+}
+
+const std::vector<c10::Device>& RpcAgent::getDevices() const {
+  // By default the agent is CPU-only.
+  static const std::vector<c10::Device> noDevices = {};
+  return noDevices;
+}
+
 std::unordered_map<std::string, std::string> RpcAgent::getDebugInfo() {
   /* This would later include more info other than metrics for eg: may include
      stack traces for the threads owned by the agent */
@@ -280,6 +324,9 @@ std::unordered_map<std::string, std::string> RpcAgent::getDebugInfo() {
   return getMetrics();
 }
 
-} // namespace rpc
-} // namespace distributed
-} // namespace torch
+std::ostream& operator<<(std::ostream& os, const WorkerInfo& workerInfo) {
+  return os << "WorkerInfo(id=" << workerInfo.id_
+            << ", name=" << workerInfo.name_ << ')';
+}
+
+} // namespace torch::distributed::rpc

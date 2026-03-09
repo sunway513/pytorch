@@ -1,18 +1,20 @@
+#include <ATen/CPUGeneratorImpl.h>
+// TODO(antoniojkim): Add CUDA support for make_generator_for_device
+// #ifdef USE_CUDA
+// #include <ATen/cuda/CUDAGeneratorImpl.h>
+// #endif
+#ifdef USE_MPS
+#include <ATen/mps/MPSGeneratorImpl.h>
+#endif
+
 #include <torch/csrc/jit/runtime/register_ops_utils.h>
+#include <torch/csrc/jit/runtime/slice_indices_adjust.h>
+#include <limits>
 
-namespace torch {
-namespace jit {
-c10::AliasAnalysisKind aliasAnalysisFromSchema() {
-  return c10::AliasAnalysisKind::FROM_SCHEMA;
-}
+#include <c10/util/Exception.h>
+#include <c10/util/irange.h>
 
-c10::AliasAnalysisKind aliasAnalysisConservative() {
-  return c10::AliasAnalysisKind::CONSERVATIVE;
-}
-
-c10::AliasAnalysisKind aliasAnalysisSpecialCase() {
-  return c10::AliasAnalysisKind::INTERNAL_SPECIAL_CASE;
-}
+namespace torch::jit {
 
 template <>
 c10::impl::GenericList make_result_list<IValue>(const TypePtr& elemType) {
@@ -20,58 +22,52 @@ c10::impl::GenericList make_result_list<IValue>(const TypePtr& elemType) {
 }
 
 template <>
-int listIndex<at::Tensor>(Stack& stack) {
+void listIndex<at::Tensor>(Stack& stack) {
   at::Tensor elem = pop(stack).to<at::Tensor>();
   c10::List<at::Tensor> list = pop(stack).to<c10::List<at::Tensor>>();
 
   auto pos =
       std::find_if(list.begin(), list.end(), [elem](const at::Tensor& b) {
         const auto cmp_result = elem.eq(b);
-        return cmp_result.is_nonzero();
+        return at::native::is_nonzero(cmp_result);
       });
 
   if (pos != list.end()) {
     push(stack, static_cast<int64_t>(std::distance(list.begin(), pos)));
   } else {
-    AT_ERROR("'", elem, "' is not in list");
+    TORCH_CHECK(false, "'", elem, "' is not in list");
   }
-
-  return 0;
 }
 
 template <>
-int listCount<at::Tensor>(Stack& stack) {
+void listCount<at::Tensor>(Stack& stack) {
   at::Tensor elem = pop(stack).to<at::Tensor>();
   c10::List<at::Tensor> list = pop(stack).to<c10::List<at::Tensor>>();
 
   const int64_t count =
       std::count_if(list.begin(), list.end(), [&](const at::Tensor& b) {
         const auto cmp_result = elem.eq(b);
-        return cmp_result.is_nonzero();
+        return at::native::is_nonzero(cmp_result);
       });
   push(stack, count);
-
-  return 0;
 }
 
 template <>
-int listEq<at::Tensor>(Stack& stack) {
+void listEq<at::Tensor>(Stack& stack) {
   c10::List<at::Tensor> b = pop(stack).to<c10::List<at::Tensor>>();
   c10::List<at::Tensor> a = pop(stack).to<c10::List<at::Tensor>>();
   push(stack, tensor_list_equal(a, b));
-  return 0;
 }
 
 template <>
-int listNe<at::Tensor>(Stack& stack) {
+void listNe<at::Tensor>(Stack& stack) {
   c10::List<at::Tensor> b = pop(stack).to<c10::List<at::Tensor>>();
   c10::List<at::Tensor> a = pop(stack).to<c10::List<at::Tensor>>();
   push(stack, !tensor_list_equal(a, b));
-  return 0;
 }
 
 template <>
-int listSort<at::Tensor>(Stack& stack) {
+void listSort<at::Tensor>(Stack& stack) {
   bool reverse = pop(stack).toBool();
   c10::List<at::Tensor> list = pop(stack).toTensorList();
   std::sort(
@@ -82,133 +78,52 @@ int listSort<at::Tensor>(Stack& stack) {
         if (a.getIntrusivePtr() == b.getIntrusivePtr()) {
           return false;
         }
-        return (a.lt(b).is_nonzero()) ^ reverse;
+        return (at::native::is_nonzero(a.lt(b))) ^ reverse;
       });
-  return 0;
 }
 
 template <>
-int listCopyAndSort<at::Tensor>(Stack& stack) {
+void listCopyAndSort<at::Tensor>(Stack& stack) {
   c10::List<at::Tensor> list = pop(stack).toTensorList();
   auto list_copied = list.copy();
   std::sort(
       list_copied.begin(),
       list_copied.end(),
       [](const at::Tensor& a, const at::Tensor& b) {
-        return a.lt(b).is_nonzero();
+        return at::native::is_nonzero(a.lt(b));
       });
   push(stack, list_copied);
-  return 0;
 }
 
 template <>
-int listRemove<at::Tensor>(Stack& stack) {
+void listRemove<at::Tensor>(Stack& stack) {
   at::Tensor elem = pop(stack).to<at::Tensor>();
   c10::List<at::Tensor> list = pop(stack).to<c10::List<at::Tensor>>();
 
   auto pos = std::find_if(list.begin(), list.end(), [&](const at::Tensor& b) {
     const auto cmp_result = elem.eq(b);
-    return cmp_result.is_nonzero();
+    return at::native::is_nonzero(cmp_result);
   });
 
   if (pos != list.end()) {
     list.erase(pos);
   } else {
-    AT_ERROR("list.remove(x): x not in list");
-  }
-
-  return 0;
-}
-
-void checkImplicitTensorToNum(at::Tensor t, bool toInt) {
-  if (t.requires_grad()) {
-    throw std::runtime_error(
-        "Cannot input a tensor that requires grad as a scalar argument");
-  }
-  if (t.sizes().size() != 0) {
-    throw std::runtime_error(
-        "Cannot input a tensor of dimension other than 0 as a scalar argument");
-  }
-  if (toInt && !isIntegralType(t.scalar_type(), /*includeBool=*/false)) {
-    std::stringstream ss;
-    ss << "Cannot input a tensor of type " << t.scalar_type()
-       << " as an integral argument";
-    throw std::runtime_error(ss.str());
+    TORCH_CHECK(false, "list.remove(x): x not in list");
   }
 }
 
-IValue tensorToListRecursive(
-    char* data,
-    int64_t cur_dim,
-    int64_t num_tensor_dims,
-    TypePtr ty,
-    at::ScalarType scalar_ty,
-    at::IntArrayRef sizes,
-    at::IntArrayRef strides,
-    size_t element_size) {
-  // If ty is a ListType, get the element type.
-  if (auto list_type = ty->cast<ListType>()) {
-    ty = list_type->getElementType();
-  } else {
-    // If the output type is a scalar, read and push one scalar of
-    // the right type onto the stack.
-    if (ty == IntType::get()) {
-      int64_t scalar = *(int64_t*)data;
-      return IValue(scalar);
-    } else if (ty == FloatType::get()) {
-      TORCH_INTERNAL_ASSERT(
-          scalar_ty == at::ScalarType::Float ||
-              scalar_ty == at::ScalarType::Double,
-          "Unexpected scalar type for Tensor");
-      double scalar =
-          scalar_ty == at::ScalarType::Float ? *(float*)data : *(double*)data;
-      return IValue(scalar);
-    } else if (ty == BoolType::get()) {
-      bool scalar = *(bool*)data;
-      return IValue(scalar);
-    } else {
-      TORCH_CHECK(
-          false,
-          ty->python_str(),
-          " is not one of the supported types for tolist: int, float, bool");
-    }
-  }
-
-  // Make the result list consisting of elements of type ty. Since this
-  // invocation is processing dimension cur_dim, there will be sizes[cur_dim]
-  // output elements.
-  auto result = c10::impl::GenericList(ty);
-  result.reserve(sizes[cur_dim]);
-
-  // Since ty was a list type, tensorToListRecursive needs to be called
-  // recursively on each slice of the tensor in the current dimension.
-  for (int64_t i = 0, e = sizes[cur_dim]; i < e; ++i) {
-    auto inner_result = tensorToListRecursive(
-        data,
-        cur_dim + 1,
-        num_tensor_dims,
-        ty,
-        scalar_ty,
-        sizes,
-        strides,
-        element_size);
-
-    if (inner_result.isList()) {
-      result.emplace_back(inner_result.toList());
-    } else if (inner_result.isDouble()) {
-      result.emplace_back(inner_result.toDouble());
-    } else if (inner_result.isInt()) {
-      result.emplace_back(inner_result.toInt());
-    } else if (inner_result.isBool()) {
-      result.emplace_back(inner_result.toBool());
-    } else {
-      TORCH_INTERNAL_ASSERT("Unknown return type for tensorToListRecursive");
-    }
-
-    data += strides[cur_dim] * element_size;
-  }
-
-  return result;
+void checkImplicitTensorToNum(const at::Tensor& t, bool toInt) {
+  TORCH_CHECK(
+      !t.requires_grad(),
+      "Cannot input a tensor that requires grad as a scalar argument");
+  TORCH_CHECK(
+      t.sizes().empty(),
+      "Cannot input a tensor of dimension other than 0 as a scalar argument");
+  TORCH_CHECK(
+      !toInt || isIntegralType(t.scalar_type(), /*includeBool=*/false),
+      "Cannot input a tensor of type ",
+      t.scalar_type(),
+      " as an integral argument");
 }
 
 void checkDoubleInRange(double a) {
@@ -216,7 +131,7 @@ void checkDoubleInRange(double a) {
       a > double(std::numeric_limits<int64_t>::max()) ||
       a < double(std::numeric_limits<int64_t>::min())) {
     throw c10::Error(
-        "Cannot convert float " + c10::to_string(a) + " to integer", "");
+        "Cannot convert float " + std::to_string(a) + " to integer");
     return;
   }
 }
@@ -226,7 +141,7 @@ int64_t partProduct(int n, int m) {
     return (int64_t)n;
   if (m == (n + 2))
     return (int64_t)n * m;
-  int k = (n + m) / 2;
+  auto k = n + (m - n) / 2; // Overflow-safe midpoint
   if ((k & 1) != 1)
     k = k - 1;
   return partProduct(n, k) * partProduct(k + 2, m);
@@ -242,12 +157,12 @@ void loop(int n, int64_t& p, int64_t& r) {
 
 int nminussumofbits(int v) {
   long w = (long)v;
-  w -= (0xaaaaaaaa & w) >> 1;
-  w = (w & 0x33333333) + ((w >> 2) & 0x33333333);
-  w = (w + (w >> 4)) & 0x0f0f0f0f;
-  w += w >> 8;
-  w += w >> 16;
-  return v - (int)(w & 0xff);
+  w -= (0xaaaaaaaa & w) >> 1; // NOLINT
+  w = (w & 0x33333333) + ((w >> 2) & 0x33333333); // NOLINT
+  w = (w + (w >> 4)) & 0x0f0f0f0f; // NOLINT
+  w += w >> 8; // NOLINT
+  w += w >> 16; // NOLINT
+  return v - (int)(w & 0xff); // NOLINT
 }
 
 int64_t factorial(int n) {
@@ -266,33 +181,21 @@ double radians(double x) {
   return x * degToRad;
 }
 
-int64_t normalizeIndex(int64_t idx, int64_t list_size) {
-  if (idx < 0) {
-    // Handle negative indexing
-    idx = list_size + idx;
-  }
-  return idx;
-}
-
-int listAppend(Stack& stack) {
+void listAppend(Stack& stack) {
   IValue el = pop(stack).to<IValue>();
   c10::List<IValue> list = pop(stack).to<c10::List<IValue>>();
 
   list.push_back(std::move(el));
   push(stack, std::move(list));
-
-  return 0;
 }
 
-int listReverse(Stack& stack) {
+void listReverse(Stack& stack) {
   c10::List<IValue> list = pop(stack).to<c10::List<IValue>>();
 
   std::reverse(list.begin(), list.end());
-
-  return 0;
 }
 
-int listPopImpl(Stack& stack, const char* empty_message) {
+void listPopImpl(Stack& stack, const char* empty_message) {
   int64_t idx = pop(stack).to<int64_t>();
   c10::List<IValue> list = pop(stack).to<c10::List<IValue>>();
 
@@ -300,33 +203,29 @@ int listPopImpl(Stack& stack, const char* empty_message) {
   const int64_t normalized_idx = normalizeIndex(idx, list_size);
 
   if (list_size == 0) {
-    AT_ERROR(empty_message);
+    TORCH_CHECK(false, empty_message);
   }
 
   push(stack, getItem(list, idx));
   list.erase(list.begin() + normalized_idx);
-
-  return 0;
 }
 
-int listPop(Stack& stack) {
+void listPop(Stack& stack) {
   return listPopImpl(stack, "pop from empty list");
 }
 
-int listClear(Stack& stack) {
+void listClear(Stack& stack) {
   c10::List<IValue> list = pop(stack).to<c10::List<IValue>>();
 
   list.clear();
-  return 0;
 }
 
-int listDelete(Stack& stack) {
+void listDelete(Stack& stack) {
   listPopImpl(stack, "pop index out of range");
   pop(stack);
-  return 0;
 }
 
-int listInsert(Stack& stack) {
+void listInsert(Stack& stack) {
   IValue elem = pop(stack).to<IValue>();
   int64_t idx = pop(stack).to<int64_t>();
   c10::List<IValue> list = pop(stack).to<c10::List<IValue>>();
@@ -343,95 +242,84 @@ int listInsert(Stack& stack) {
   } else {
     list.insert(list.begin() + normalized_idx, elem);
   }
-
-  return 0;
 }
 
-int listExtend(Stack& stack) {
+void listExtend(Stack& stack) {
   c10::List<IValue> b = pop(stack).to<c10::List<IValue>>();
   c10::List<IValue> a = pop(stack).to<c10::List<IValue>>();
 
   a.reserve(a.size() + b.size());
-  for (size_t i = 0; i < b.size(); ++i) {
+  for (const auto i : c10::irange(b.size())) {
     a.push_back(b.get(i));
   }
-  return 0;
 }
 
-int listCopy(Stack& stack) {
+void listCopy(Stack& stack) {
   c10::List<IValue> list = pop(stack).to<c10::List<IValue>>();
   push(stack, list.copy());
-  return 0;
 }
 
-int listSelect(Stack& stack) {
+void listSelect(Stack& stack) {
   int64_t idx = pop(stack).to<int64_t>();
   c10::List<IValue> list = pop(stack).to<c10::List<IValue>>();
 
-  auto element = getItem(list, idx);
-  push(stack, std::move(element));
-  return 0;
+  push(stack, getItem(list, idx));
 }
 
-int listLen(Stack& stack) {
+void listLen(Stack& stack) {
   c10::List<IValue> a = pop(stack).to<c10::List<IValue>>();
 
   const int64_t size = a.size();
   push(stack, size);
-  return 0;
 }
 
-int listList(Stack& stack) {
+void listList(Stack& stack) {
   c10::List<IValue> a = pop(stack).to<c10::List<IValue>>();
   push(stack, a.copy());
-  return 0;
 }
 
-int listAdd(Stack& stack) {
+void listAdd(Stack& stack) {
   c10::List<IValue> b = pop(stack).to<c10::List<IValue>>();
   c10::List<IValue> a = pop(stack).to<c10::List<IValue>>();
 
   c10::List<IValue> ret = make_result_list<IValue>(a.elementType());
 
   if (a.use_count() == 1) {
-    ret = std::move(a);
+    ret = a;
   } else {
     ret = a.copy();
   }
 
-  ret.append(std::move(b));
+  ret.append(b);
 
   push(stack, std::move(ret));
-  return 0;
 }
 
-int listInplaceAdd(Stack& stack) {
-  c10::List<IValue> b = pop(stack).to<List<IValue>>();
-  c10::List<IValue> a = pop(stack).to<List<IValue>>();
-  a.append(std::move(b));
+void listInplaceAdd(Stack& stack) {
+  c10::List<IValue> b = pop(stack).to<c10::List<IValue>>();
+  c10::List<IValue> a = pop(stack).to<c10::List<IValue>>();
+  a.append(b);
   push(stack, std::move(a));
-  return 0;
 }
 
-int listMulIntLeftInPlace(Stack& stack) {
+void listMulIntLeftInPlace(Stack& stack) {
   int64_t n = pop(stack).to<int64_t>();
   c10::List<IValue> list = pop(stack).to<c10::List<IValue>>();
   if (n <= 0) {
     list.clear();
   } else if (n > 1) {
     size_t list_size = list.size();
-    for (auto i = 1; i < n; i++) {
-      for (size_t j = 0; j < list_size; j++) {
+    for ([[maybe_unused]] const auto i : c10::irange(1, n)) {
+      for (const auto j : c10::irange(list_size)) {
         list.push_back(list.get(j));
       }
     }
   }
 
   push(stack, std::move(list));
-  return 0;
 }
 
-int listMulIntLeft(Stack& stack) {
+void listMulIntLeft(Stack& stack) {
   int64_t n = pop(stack).to<int64_t>();
   c10::List<IValue> list = pop(stack).to<c10::List<IValue>>();
 
@@ -439,17 +327,16 @@ int listMulIntLeft(Stack& stack) {
   const auto size = list.size() * n;
   ret.reserve(size);
 
-  for (auto i = 0; i < n; i++) {
+  for ([[maybe_unused]] const auto i : c10::irange(n)) {
     for (IValue e : list) {
       ret.push_back(std::move(e));
     }
   }
 
   push(stack, std::move(ret));
-  return 0;
 }
 
-int listMulIntRight(Stack& stack) {
+void listMulIntRight(Stack& stack) {
   c10::List<IValue> list = pop(stack).to<c10::List<IValue>>();
   int64_t n = pop(stack).to<int64_t>();
 
@@ -457,49 +344,48 @@ int listMulIntRight(Stack& stack) {
   const auto size = list.size() * n;
   ret.reserve(size);
 
-  for (auto i = 0; i < n; i++) {
+  for ([[maybe_unused]] const auto i : c10::irange(n)) {
     for (IValue e : list) {
       ret.push_back(std::move(e));
     }
   }
 
   push(stack, std::move(ret));
-  return 0;
 }
 
-int listSlice(Stack& stack) {
-  int64_t step = pop(stack).to<int64_t>();
-  int64_t end = pop(stack).to<int64_t>();
-  int64_t start = pop(stack).to<int64_t>();
+void listSlice(Stack& stack) {
+  auto step_val = pop(stack);
+  auto end_val = pop(stack);
+  auto start_val = pop(stack);
+
+  // By default, both start and end will be None.
+  // By python convention, they will be translated into
+  // INT64_MAX. If the step size is not given, it will be 1.
+  int64_t step = step_val.isInt() ? step_val.to<int64_t>() : 1;
+  int64_t end = end_val.isInt() ? end_val.to<int64_t>()
+                                : std::numeric_limits<int64_t>::max();
+  int64_t start = start_val.isInt() ? start_val.to<int64_t>()
+                                    : std::numeric_limits<int64_t>::max();
+
   c10::List<IValue> list = pop(stack).to<c10::List<IValue>>();
 
   const int64_t list_size = list.size();
 
-  // clamp start and end to the bounds of the list
-  const auto normalized_start =
-      std::max((int64_t)0, normalizeIndex(start, list_size));
-  const auto normalized_end =
-      std::min(list_size, normalizeIndex(end, list_size));
-
   c10::List<IValue> sliced_list = make_result_list<IValue>(list.elementType());
-  if (normalized_end <= normalized_start) {
-    // early exit if the slice is trivially empty
-    push(stack, std::move(sliced_list));
-    return 0;
-  }
+  const int64_t num_values =
+      slice_indices_adjust(list_size, &start, &end, step);
+  sliced_list.reserve(num_values);
 
-  sliced_list.reserve(normalized_end - normalized_start);
-
-  for (auto i = normalized_start; i < normalized_end;) {
+  int i = start;
+  for ([[maybe_unused]] const auto j : c10::irange(num_values)) {
     sliced_list.push_back(list.get(i));
     i += step;
   }
 
   push(stack, std::move(sliced_list));
-  return 0;
 }
 
-int listSetItem(Stack& stack) {
+void listSetItem(Stack& stack) {
   IValue value = pop(stack).to<IValue>();
   int64_t idx = pop(stack).to<int64_t>();
   c10::List<IValue> list = pop(stack).to<c10::List<IValue>>();
@@ -507,7 +393,41 @@ int listSetItem(Stack& stack) {
   setItem(list, idx, std::move(value));
 
   push(stack, std::move(list));
-  return 0;
 }
-} // namespace jit
-} // namespace torch
+
+at::Generator make_generator_for_device(
+    c10::Device device,
+    std::optional<int64_t> seed) {
+  if (device.is_cpu()) {
+    if (seed.has_value()) {
+      return at::detail::createCPUGenerator(seed.value());
+    } else {
+      return at::detail::createCPUGenerator();
+    }
+// TODO(antoniojkim): Enable support for CUDA device
+//                    Implementation below causes issues during rocm build
+// #ifdef USE_CUDA
+//   } else if (device.is_cuda()) {
+//     auto generator = at::cuda::detail::createCUDAGenerator(device.index());
+//     if (seed.has_value()) {
+//       generator.set_current_seed(seed.value());
+//     }
+//     return generator;
+// #endif
+#ifdef USE_MPS
+  } else if (device.is_mps()) {
+    if (seed.has_value()) {
+      return at::mps::detail::createMPSGenerator(seed.value());
+    } else {
+      return at::mps::detail::createMPSGenerator();
+    }
+#endif
+  } else {
+    TORCH_CHECK(
+        false,
+        "Unsupported device for at::make_generator_for_device found: ",
+        device.str());
+  }
+}
+
+} // namespace torch::jit

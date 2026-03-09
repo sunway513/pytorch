@@ -1,5 +1,6 @@
-from .cells import *
-from .factory import *
+from .cells import *  # noqa: F403
+from .factory import *  # noqa: F403
+
 
 # (output, next_state) = cell(input, state)
 seqLength = 100

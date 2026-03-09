@@ -1,8 +1,8 @@
 Tensor Basics
 =============
 
-The ATen tensor library backing PyTorch is a simple tensor library thats exposes
-the Tensor operations in Torch directly in C++14. ATen's API is auto-generated
+The ATen tensor library backing PyTorch is a simple tensor library that exposes
+the Tensor operations in Torch directly in C++17. ATen's API is auto-generated
 from the same declarations PyTorch uses so the two APIs will track each other
 over time.
 
@@ -76,10 +76,10 @@ CUDA accessors
 .. code-block:: cpp
 
   __global__ void packed_accessor_kernel(
-      PackedTensorAccessor64<float, 2> foo,
+      torch::PackedTensorAccessor64<float, 2> foo,
       float* trace) {
-    int i=threadIdx.x
-    gpuAtomicAdd(trace, foo[i][i])
+    int i = threadIdx.x;
+    gpuAtomicAdd(trace, foo[i][i]);
   }
 
   torch::Tensor foo = torch::rand({12, 12});

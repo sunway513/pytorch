@@ -1,20 +1,24 @@
-from __future__ import absolute_import
+# mypy: allow-untyped-defs
 import sys
 
-__all__ = ['register_after_fork']
 
-if sys.platform == 'win32' or sys.version_info < (3, 7):
+__all__ = ["register_after_fork"]
+
+if sys.platform == "win32":
     import multiprocessing.util as _util
 
     def _register(func):
         def wrapper(arg):
             func()
+
         _util.register_after_fork(_register, wrapper)
+
 else:
     import os
 
     def _register(func):
         os.register_at_fork(after_in_child=func)
+
 
 def register_after_fork(func):
     """Register a callable to be executed in the child process after a fork.
@@ -24,7 +28,7 @@ def register_after_fork(func):
         ``multiprocessing`` module. In python >= 3.7 it also works with
         ``os.fork()``.
 
-    Arguments:
+    Args:
         func (function): Function taking no arguments to be called in the child after fork
 
     """

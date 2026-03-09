@@ -1,11 +1,16 @@
-# coding=utf-8
+import torch.nn.functional as F
+from torch import Tensor
+from torch.nn.common_types import _size_any_t
+
 from .module import Module
-from .. import functional as F
+
+
+__all__ = ["Fold", "Unfold"]
 
 
 class Fold(Module):
-    r"""Combines an array of sliding local blocks into a large containing
-    tensor.
+    (
+        r"""Combines an array of sliding local blocks into a large containing tensor.
 
     Consider a batched :attr:`input` tensor containing sliding local blocks,
     e.g., patches of images, of shape :math:`(N, C \times  \prod(\text{kernel\_size}), L)`,
@@ -38,21 +43,23 @@ class Fold(Module):
     * :attr:`padding` controls the amount of implicit zero-paddings on both
       sides for :attr:`padding` number of points for each dimension before
       reshaping.
-
-    * :attr:`dilation` controls the spacing between the kernel points; also known as the à trous algorithm.
+"""
+        """
+    * :attr:`dilation` controls the spacing between the kernel points; also known as the \u00e0 trous algorithm.
       It is harder to describe, but this `link`_ has a nice visualization of what :attr:`dilation` does.
-
+"""
+        r"""
     Args:
         output_size (int or tuple): the shape of the spatial dimensions of the
                                     output (i.e., ``output.sizes()[2:]``)
         kernel_size (int or tuple): the size of the sliding blocks
-        stride (int or tuple): the stride of the sliding blocks in the input
-                               spatial dimensions. Default: 1
-        padding (int or tuple, optional): implicit zero padding to be added on
-                                          both sides of input. Default: 0
         dilation (int or tuple, optional): a parameter that controls the
                                            stride of elements within the
                                            neighborhood. Default: 1
+        padding (int or tuple, optional): implicit zero padding to be added on
+                                          both sides of input. Default: 0
+        stride (int or tuple): the stride of the sliding blocks in the input
+                               spatial dimensions. Default: 1
 
     * If :attr:`output_size`, :attr:`kernel_size`, :attr:`dilation`,
       :attr:`padding` or :attr:`stride` is an int or a tuple of length 1 then
@@ -87,6 +94,7 @@ class Fold(Module):
         where ``divisor`` is a tensor that depends only on the shape
         and dtype of the ``input``:
 
+        >>> # xdoctest: +SKIP
         >>> input_ones = torch.ones(input.shape, dtype=input.dtype)
         >>> divisor = fold(unfold(input_ones))
 
@@ -95,12 +103,12 @@ class Fold(Module):
         other (up to constant divisor).
 
     .. warning::
-        Currently, only 4-D output tensors (batched image-like tensors) are
-        supported.
+        Currently, only unbatched (3D) or batched (4D) image-like output tensors are supported.
 
     Shape:
-        - Input: :math:`(N, C \times \prod(\text{kernel\_size}), L)`
-        - Output: :math:`(N, C, \text{output\_size}[0], \text{output\_size}[1], \dots)` as described above
+        - Input: :math:`(N, C \times \prod(\text{kernel\_size}), L)` or :math:`(C \times \prod(\text{kernel\_size}), L)`
+        - Output: :math:`(N, C, \text{output\_size}[0], \text{output\_size}[1], \dots)`
+          or :math:`(C, \text{output\_size}[0], \text{output\_size}[1], \dots)` as described above
 
     Examples::
 
@@ -114,30 +122,58 @@ class Fold(Module):
         https://github.com/vdumoulin/conv_arithmetic/blob/master/README.md
 
     """
-    __constants__ = ['output_size', 'kernel_size', 'dilation', 'padding',
-                     'stride']
+    )
 
-    def __init__(self, output_size, kernel_size, dilation=1, padding=0, stride=1):
-        super(Fold, self).__init__()
+    __constants__ = ["output_size", "kernel_size", "dilation", "padding", "stride"]
+    output_size: _size_any_t
+    kernel_size: _size_any_t
+    dilation: _size_any_t
+    padding: _size_any_t
+    stride: _size_any_t
+
+    def __init__(
+        self,
+        output_size: _size_any_t,
+        kernel_size: _size_any_t,
+        dilation: _size_any_t = 1,
+        padding: _size_any_t = 0,
+        stride: _size_any_t = 1,
+    ) -> None:
+        super().__init__()
         self.output_size = output_size
         self.kernel_size = kernel_size
         self.dilation = dilation
         self.padding = padding
         self.stride = stride
 
-    def forward(self, input):
-        return F.fold(input, self.output_size, self.kernel_size, self.dilation,
-                      self.padding, self.stride)
+    def forward(self, input: Tensor) -> Tensor:
+        """
+        Runs the forward pass.
+        """
+        return F.fold(
+            input,
+            self.output_size,
+            self.kernel_size,
+            self.dilation,
+            self.padding,
+            self.stride,
+        )
 
-    def extra_repr(self):
-        return 'output_size={output_size}, kernel_size={kernel_size}, ' \
-            'dilation={dilation}, padding={padding}, stride={stride}'.format(
+    def extra_repr(self) -> str:
+        """
+        Return the extra representation of the module.
+        """
+        return (
+            "output_size={output_size}, kernel_size={kernel_size}, "
+            "dilation={dilation}, padding={padding}, stride={stride}".format(
                 **self.__dict__
             )
+        )
 
 
 class Unfold(Module):
-    r"""Extracts sliding local blocks from a batched input tensor.
+    (
+        r"""Extracts sliding local blocks from a batched input tensor.
 
     Consider a batched :attr:`input` tensor of shape :math:`(N, C, *)`,
     where :math:`N` is the batch dimension, :math:`C` is the channel dimension,
@@ -169,19 +205,21 @@ class Unfold(Module):
     * :attr:`padding` controls the amount of implicit zero-paddings on both
       sides for :attr:`padding` number of points for each dimension before
       reshaping.
-
-    * :attr:`dilation` controls the spacing between the kernel points; also known as the à trous algorithm.
+"""
+        """
+    * :attr:`dilation` controls the spacing between the kernel points; also known as the \u00e0 trous algorithm.
       It is harder to describe, but this `link`_ has a nice visualization of what :attr:`dilation` does.
-
+"""
+        r"""
     Args:
         kernel_size (int or tuple): the size of the sliding blocks
-        stride (int or tuple, optional): the stride of the sliding blocks in the input
-                                         spatial dimensions. Default: 1
-        padding (int or tuple, optional): implicit zero padding to be added on
-                                          both sides of input. Default: 0
         dilation (int or tuple, optional): a parameter that controls the
                                            stride of elements within the
                                            neighborhood. Default: 1
+        padding (int or tuple, optional): implicit zero padding to be added on
+                                          both sides of input. Default: 0
+        stride (int or tuple, optional): the stride of the sliding blocks in the input
+                                         spatial dimensions. Default: 1
 
     * If :attr:`kernel_size`, :attr:`dilation`, :attr:`padding` or
       :attr:`stride` is an int or a tuple of length 1, their values will be
@@ -216,6 +254,7 @@ class Unfold(Module):
         where ``divisor`` is a tensor that depends only on the shape
         and dtype of the ``input``:
 
+        >>> # xdoctest: +SKIP
         >>> input_ones = torch.ones(input.shape, dtype=input.dtype)
         >>> divisor = fold(unfold(input_ones))
 
@@ -241,6 +280,7 @@ class Unfold(Module):
         >>> output.size()
         torch.Size([2, 30, 4])
 
+        >>> # xdoctest: +IGNORE_WANT
         >>> # Convolution is equivalent with Unfold + Matrix Multiplication + Fold (or view to output shape)
         >>> inp = torch.randn(1, 3, 10, 12)
         >>> w = torch.randn(2, 3, 4, 5)
@@ -256,19 +296,40 @@ class Unfold(Module):
         https://github.com/vdumoulin/conv_arithmetic/blob/master/README.md
 
     """
-    __constants__ = ['kernel_size', 'dilation', 'padding', 'stride']
+    )
 
-    def __init__(self, kernel_size, dilation=1, padding=0, stride=1):
-        super(Unfold, self).__init__()
+    __constants__ = ["kernel_size", "dilation", "padding", "stride"]
+    kernel_size: _size_any_t
+    dilation: _size_any_t
+    padding: _size_any_t
+    stride: _size_any_t
+
+    def __init__(
+        self,
+        kernel_size: _size_any_t,
+        dilation: _size_any_t = 1,
+        padding: _size_any_t = 0,
+        stride: _size_any_t = 1,
+    ) -> None:
+        super().__init__()
         self.kernel_size = kernel_size
         self.dilation = dilation
         self.padding = padding
         self.stride = stride
 
-    def forward(self, input):
-        return F.unfold(input, self.kernel_size, self.dilation,
-                        self.padding, self.stride)
+    def forward(self, input: Tensor) -> Tensor:
+        """
+        Runs the forward pass.
+        """
+        return F.unfold(
+            input, self.kernel_size, self.dilation, self.padding, self.stride
+        )
 
-    def extra_repr(self):
-        return 'kernel_size={kernel_size}, dilation={dilation}, padding={padding},' \
-            ' stride={stride}'.format(**self.__dict__)
+    def extra_repr(self) -> str:
+        """
+        Return the extra representation of the module.
+        """
+        return (
+            "kernel_size={kernel_size}, dilation={dilation}, padding={padding},"
+            " stride={stride}".format(**self.__dict__)
+        )

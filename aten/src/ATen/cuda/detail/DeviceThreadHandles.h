@@ -21,9 +21,9 @@
 #include <mutex>
 #include <memory>
 
-#include <ATen/cuda/Exceptions.h>
+#include <c10/util/Exception.h>
 
-namespace at { namespace cuda { namespace {
+namespace at::cuda { namespace {
 
 template <typename Handle_t, void Create(Handle_t *), void Destroy(Handle_t)>
 struct DeviceThreadHandlePool : public std::enable_shared_from_this<DeviceThreadHandlePool<Handle_t, Create, Destroy>> {
@@ -45,7 +45,7 @@ struct DeviceThreadHandlePool : public std::enable_shared_from_this<DeviceThread
     // unordered_map<int, vector<unique_ptr<Handle>>> created_handles;
     Handle(const Handle& rhs) = delete;
     // Following https://stackoverflow.com/questions/3279543/what-is-the-copy-and-swap-idiom
-    Handle(Handle&& rhs) : Handle() { std::swap(handle, rhs.handle); }
+    Handle(Handle&& rhs) noexcept : Handle() { std::swap(handle, rhs.handle); }
     // operator= takes argument by value
     Handle& operator=(Handle rhs) { std::swap(handle, rhs.handle); return *this; }
     ~Handle() {
@@ -82,9 +82,8 @@ struct DeviceThreadHandlePool : public std::enable_shared_from_this<DeviceThread
     // so in the common case handle access doesn't incur either handle creation or a mutex lock.
     class PoolWindow
     {
-    std::shared_ptr<DeviceThreadHandlePool> parent;
     public:
-    PoolWindow(std::shared_ptr<DeviceThreadHandlePool> parent): parent(std::move(parent)) {}
+    PoolWindow(std::shared_ptr<DeviceThreadHandlePool> parent): weak_parent(std::move(parent)) {}
     ~PoolWindow(){ release(); }
 
     Handle_t reserve(int device)
@@ -95,6 +94,8 @@ struct DeviceThreadHandlePool : public std::enable_shared_from_this<DeviceThread
 
         // otherwise, either grab a handle from the pool if one is available,
         // or if not, create a new one.
+        auto parent = weak_parent.lock();
+        TORCH_CHECK(parent, "Cannot create handle during program termination");
         std::lock_guard<std::mutex> guard(parent->mutex);
 
         if(parent->available_handles[device].size() > 0)
@@ -117,9 +118,18 @@ struct DeviceThreadHandlePool : public std::enable_shared_from_this<DeviceThread
     // Stores the per-device handles currently owned by this thread
     std::unordered_map<int, Handle_t> my_handles;
 
+    std::weak_ptr<DeviceThreadHandlePool> weak_parent;
+
     // Called by the destructor.  Releases this thread's handles back into the pool.
     void release() {
-        if(my_handles.size() > 0) {
+        if(!my_handles.empty()) {
+            auto parent = weak_parent.lock();
+            if (!parent) {
+                // If this thread exits after atexit handlers have completed, the
+                // cuda context itself may be invalid, so we must leak the handles.
+                return;
+            }
+
             std::lock_guard<std::mutex> guard(parent->mutex);
             for(auto d_h : my_handles)
                 parent->available_handles[d_h.first].push_back(d_h.second);
@@ -138,4 +148,4 @@ struct DeviceThreadHandlePool : public std::enable_shared_from_this<DeviceThread
     }
 };
 
-}}}  // namespace at::cuda::detail::<anonymous>
+}}  // namespace at::cuda::detail::<anonymous>

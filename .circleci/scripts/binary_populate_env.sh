@@ -3,55 +3,26 @@ set -eux -o pipefail
 export TZ=UTC
 
 tagged_version() {
-  # Grabs version from either the env variable CIRCLE_TAG
-  # or the pytorch git described version
-  if [[ "$OSTYPE" == "msys" ]]; then
-    GIT_DESCRIBE="git --git-dir ${workdir}/p/.git describe"
-  else
-    GIT_DESCRIBE="git --git-dir ${workdir}/pytorch/.git describe"
-  fi
-  if [[ -n "${CIRCLE_TAG:-}" ]]; then
-    echo "${CIRCLE_TAG}"
-  elif ${GIT_DESCRIBE} --exact --tags >/dev/null; then
-    ${GIT_DESCRIBE} --tags
+  GIT_DIR="${workdir}/pytorch/.git"
+  GIT_DESCRIBE="git --git-dir ${GIT_DIR} describe --tags --match v[0-9]*.[0-9]*.[0-9]*"
+  if [[ ! -d "${GIT_DIR}" ]]; then
+    echo "Abort, abort! Git dir ${GIT_DIR} does not exists!"
+    kill $$
+  elif ${GIT_DESCRIBE} --exact >/dev/null; then
+    ${GIT_DESCRIBE}
   else
     return 1
   fi
 }
 
-# We need to write an envfile to persist these variables to following
-# steps, but the location of the envfile depends on the circleci executor
-if [[ "$(uname)" == Darwin ]]; then
-  # macos executor (builds and tests)
-  workdir="/Users/distiller/project"
-elif [[ "$OSTYPE" == "msys" ]]; then
-  # windows executor (builds and tests)
-  workdir="/c/w"
-elif [[ -d "/home/circleci/project" ]]; then
-  # machine executor (binary tests)
-  workdir="/home/circleci/project"
+envfile=${BINARY_ENV_FILE:-/tmp/env}
+if [[ -n "${PYTORCH_ROOT}"  ]]; then
+  workdir=$(dirname "${PYTORCH_ROOT}")
 else
   # docker executor (binary builds)
   workdir="/"
 fi
-envfile="$workdir/env"
-touch "$envfile"
-chmod +x "$envfile"
 
-# Parse the BUILD_ENVIRONMENT to package type, python, and cuda
-configs=($BUILD_ENVIRONMENT)
-export PACKAGE_TYPE="${configs[0]}"
-export DESIRED_PYTHON="${configs[1]}"
-export DESIRED_CUDA="${configs[2]}"
-if [[ "${BUILD_FOR_SYSTEM:-}" == "windows" ]]; then
-  export DESIRED_DEVTOOLSET=""
-  export LIBTORCH_CONFIG="${configs[3]:-}"
-  if [[ "$LIBTORCH_CONFIG" == 'debug' ]]; then
-    export DEBUG=1
-  fi
-else
-  export DESIRED_DEVTOOLSET="${configs[3]:-}"
-fi
 if [[ "$PACKAGE_TYPE" == 'libtorch' ]]; then
   export BUILD_PYTHONLESS=1
 fi
@@ -59,21 +30,26 @@ fi
 # Pick docker image
 export DOCKER_IMAGE=${DOCKER_IMAGE:-}
 if [[ -z "$DOCKER_IMAGE" ]]; then
-  if [[ "$PACKAGE_TYPE" == conda ]]; then
-    export DOCKER_IMAGE="pytorch/conda-cuda"
-  elif [[ "$DESIRED_CUDA" == cpu ]]; then
-    export DOCKER_IMAGE="pytorch/manylinux-cuda100"
+  if [[ "$DESIRED_CUDA" == cpu ]]; then
+    export DOCKER_IMAGE="pytorch/manylinux2_28:cpu"
   else
-    export DOCKER_IMAGE="pytorch/manylinux-cuda${DESIRED_CUDA:2}"
+    export DOCKER_IMAGE="pytorch/manylinux2_28-builder:${DESIRED_CUDA:2}"
   fi
 fi
+
+USE_GOLD_LINKER="OFF"
+# GOLD linker can not be used if CUPTI is statically linked into PyTorch, see https://github.com/pytorch/pytorch/issues/57744
+if [[ ${DESIRED_CUDA} == "cpu" ]]; then
+  USE_GOLD_LINKER="ON"
+fi
+
 
 # Default to nightly, since that's where this normally uploads to
 PIP_UPLOAD_FOLDER='nightly/'
 # We put this here so that OVERRIDE_PACKAGE_VERSION below can read from it
 export DATE="$(date -u +%Y%m%d)"
-#TODO: We should be pulling semver version from the base version.txt
-BASE_BUILD_VERSION="1.6.0.dev$DATE"
+BASE_BUILD_VERSION="$(cat ${PYTORCH_ROOT}/version.txt|cut -da -f1).dev${DATE}"
+
 # Change BASE_BUILD_VERSION to git tag when on a git tag
 # Use 'git -C' to make doubly sure we're in the correct directory for checking
 # the git tag
@@ -85,84 +61,120 @@ if tagged_version >/dev/null; then
   # Turns tag v1.6.0-rc1 -> v1.6.0
   BASE_BUILD_VERSION="$(tagged_version | sed -e 's/^v//' -e 's/-.*$//')"
 fi
-if [[ "$(uname)" == 'Darwin' ]] || [[ "$DESIRED_CUDA" == "cu102" ]] || [[ "$PACKAGE_TYPE" == conda ]]; then
+if [[ "$(uname)" == 'Darwin' ]]; then
   export PYTORCH_BUILD_VERSION="${BASE_BUILD_VERSION}"
 else
   export PYTORCH_BUILD_VERSION="${BASE_BUILD_VERSION}+$DESIRED_CUDA"
 fi
+
 export PYTORCH_BUILD_NUMBER=1
 
+# Set triton version as part of PYTORCH_EXTRA_INSTALL_REQUIREMENTS
+TRITON_VERSION=$(cat $PYTORCH_ROOT/.ci/docker/triton_version.txt)
+TRITON_CONSTRAINT="platform_system == 'Linux'"
 
-JAVA_HOME=
-BUILD_JNI=OFF
-if [[ "$PACKAGE_TYPE" == libtorch ]]; then
-  POSSIBLE_JAVA_HOMES=()
-  POSSIBLE_JAVA_HOMES+=(/usr/local)
-  POSSIBLE_JAVA_HOMES+=(/usr/lib/jvm/java-8-openjdk-amd64)
-  POSSIBLE_JAVA_HOMES+=(/Library/Java/JavaVirtualMachines/*.jdk/Contents/Home)
-  for JH in "${POSSIBLE_JAVA_HOMES[@]}" ; do
-    if [[ -e "$JH/include/jni.h" ]] ; then
-      echo "Found jni.h under $JH"
-      JAVA_HOME="$JH"
-      BUILD_JNI=ON
-      break
-    fi
-  done
-  if [ -z "$JAVA_HOME" ]; then
-    echo "Did not find jni.h"
+if [[ "$PACKAGE_TYPE" =~ .*wheel.* &&  -n "${PYTORCH_EXTRA_INSTALL_REQUIREMENTS:-}" && ! "$PYTORCH_BUILD_VERSION" =~ .*xpu.* ]]; then
+  TRITON_REQUIREMENT="triton==${TRITON_VERSION}; ${TRITON_CONSTRAINT}"
+  if [[ -n "$PYTORCH_BUILD_VERSION" && "$PYTORCH_BUILD_VERSION" =~ .*dev.* ]]; then
+      TRITON_SHORTHASH=$(cut -c1-8 $PYTORCH_ROOT/.ci/docker/ci_commit_pins/triton.txt)
+      TRITON_REQUIREMENT="triton==${TRITON_VERSION}+git${TRITON_SHORTHASH}; ${TRITON_CONSTRAINT}"
   fi
+  export PYTORCH_EXTRA_INSTALL_REQUIREMENTS="${PYTORCH_EXTRA_INSTALL_REQUIREMENTS} | ${TRITON_REQUIREMENT}"
 fi
 
-cat >>"$envfile" <<EOL
+# Set triton via PYTORCH_EXTRA_INSTALL_REQUIREMENTS for triton rocm package
+if [[ "$PACKAGE_TYPE" =~ .*wheel.* && -n "$PYTORCH_BUILD_VERSION" && "$PYTORCH_BUILD_VERSION" =~ .*rocm.* && $(uname) == "Linux" ]]; then
+    TRITON_REQUIREMENT="triton-rocm==${TRITON_VERSION}; ${TRITON_CONSTRAINT}"
+    if [[ -n "$PYTORCH_BUILD_VERSION" && "$PYTORCH_BUILD_VERSION" =~ .*dev.* ]]; then
+        TRITON_SHORTHASH=$(cut -c1-8 $PYTORCH_ROOT/.ci/docker/ci_commit_pins/triton.txt)
+        TRITON_REQUIREMENT="triton-rocm==${TRITON_VERSION}+git${TRITON_SHORTHASH}; ${TRITON_CONSTRAINT}"
+    fi
+    if [[ -z "${PYTORCH_EXTRA_INSTALL_REQUIREMENTS:-}" ]]; then
+        export PYTORCH_EXTRA_INSTALL_REQUIREMENTS="${TRITON_REQUIREMENT}"
+    else
+        export PYTORCH_EXTRA_INSTALL_REQUIREMENTS="${PYTORCH_EXTRA_INSTALL_REQUIREMENTS} | ${TRITON_REQUIREMENT}"
+    fi
+fi
+
+# Set triton via PYTORCH_EXTRA_INSTALL_REQUIREMENTS for triton xpu package
+if [[ "$PACKAGE_TYPE" =~ .*wheel.* && -n "$PYTORCH_BUILD_VERSION" && "$PYTORCH_BUILD_VERSION" =~ .*xpu.* ]]; then
+    TRITON_VERSION=$(cat $PYTORCH_ROOT/.ci/docker/triton_xpu_version.txt)
+    TRITON_REQUIREMENT="triton-xpu==${TRITON_VERSION}"
+    if [[ -n "$PYTORCH_BUILD_VERSION" && "$PYTORCH_BUILD_VERSION" =~ .*dev.* ]]; then
+        TRITON_SHORTHASH=$(cut -c1-8 $PYTORCH_ROOT/.ci/docker/ci_commit_pins/triton-xpu.txt)
+        TRITON_REQUIREMENT="triton-xpu==${TRITON_VERSION}+git${TRITON_SHORTHASH}"
+    fi
+    if [[ -z "${PYTORCH_EXTRA_INSTALL_REQUIREMENTS:-}" ]]; then
+        export PYTORCH_EXTRA_INSTALL_REQUIREMENTS="${TRITON_REQUIREMENT}"
+    else
+        export PYTORCH_EXTRA_INSTALL_REQUIREMENTS="${PYTORCH_EXTRA_INSTALL_REQUIREMENTS} | ${TRITON_REQUIREMENT}"
+    fi
+fi
+
+USE_GLOO_WITH_OPENSSL="ON"
+if [[ "$GPU_ARCH_TYPE" =~ .*aarch64.* ]]; then
+  USE_GLOO_WITH_OPENSSL="OFF"
+  USE_GOLD_LINKER="OFF"
+fi
+
+cat >"$envfile" <<EOL
 # =================== The following code will be executed inside Docker container ===================
 export TZ=UTC
 echo "Running on $(uname -a) at $(date)"
 
 export PACKAGE_TYPE="$PACKAGE_TYPE"
-export DESIRED_PYTHON="$DESIRED_PYTHON"
+export DESIRED_PYTHON="${DESIRED_PYTHON:-}"
 export DESIRED_CUDA="$DESIRED_CUDA"
 export LIBTORCH_VARIANT="${LIBTORCH_VARIANT:-}"
 export BUILD_PYTHONLESS="${BUILD_PYTHONLESS:-}"
-export DESIRED_DEVTOOLSET="$DESIRED_DEVTOOLSET"
-if [[ "${BUILD_FOR_SYSTEM:-}" == "windows" ]]; then
+if [[ "${OSTYPE}" == "msys" ]]; then
   export LIBTORCH_CONFIG="${LIBTORCH_CONFIG:-}"
-  export DEBUG="${DEBUG:-}"
+  if [[ "${LIBTORCH_CONFIG:-}" == 'debug' ]]; then
+    export DEBUG=1
+  fi
+  export DESIRED_DEVTOOLSET=""
+else
+  export DESIRED_DEVTOOLSET="${DESIRED_DEVTOOLSET:-}"
 fi
 
 export DATE="$DATE"
-export NIGHTLIES_DATE_PREAMBLE=1.6.0.dev
+export NIGHTLIES_DATE_PREAMBLE=1.14.0.dev
 export PYTORCH_BUILD_VERSION="$PYTORCH_BUILD_VERSION"
 export PYTORCH_BUILD_NUMBER="$PYTORCH_BUILD_NUMBER"
 export OVERRIDE_PACKAGE_VERSION="$PYTORCH_BUILD_VERSION"
+export PYTORCH_EXTRA_INSTALL_REQUIREMENTS="${PYTORCH_EXTRA_INSTALL_REQUIREMENTS:-}"
 
 # TODO: We don't need this anymore IIUC
 export TORCH_PACKAGE_NAME='torch'
-export TORCH_CONDA_BUILD_FOLDER='pytorch-nightly'
 
 export USE_FBGEMM=1
-export JAVA_HOME=$JAVA_HOME
-export BUILD_JNI=$BUILD_JNI
 export PIP_UPLOAD_FOLDER="$PIP_UPLOAD_FOLDER"
 export DOCKER_IMAGE="$DOCKER_IMAGE"
 
-export workdir="$workdir"
-export MAC_PACKAGE_WORK_DIR="$workdir"
-if [[ "$OSTYPE" == "msys" ]]; then
-  export PYTORCH_ROOT="$workdir/p"
-  export BUILDER_ROOT="$workdir/b"
-else
-  export PYTORCH_ROOT="$workdir/pytorch"
-  export BUILDER_ROOT="$workdir/builder"
-fi
-export MINICONDA_ROOT="$workdir/miniconda"
-export PYTORCH_FINAL_PACKAGE_DIR="$workdir/final_pkgs"
 
-export CIRCLE_TAG="${CIRCLE_TAG:-}"
-export CIRCLE_SHA1="$CIRCLE_SHA1"
-export CIRCLE_PR_NUMBER="${CIRCLE_PR_NUMBER:-}"
-export CIRCLE_BRANCH="$CIRCLE_BRANCH"
+export USE_GOLD_LINKER="${USE_GOLD_LINKER}"
+export USE_GLOO_WITH_OPENSSL="${USE_GLOO_WITH_OPENSSL}"
 # =================== The above code will be executed inside Docker container ===================
 EOL
+
+# nproc doesn't exist on darwin
+if [[ "$(uname)" != Darwin ]]; then
+  # This was lowered from 18 to 12 to avoid OOMs when compiling FlashAttentionV2
+  MEMORY_LIMIT_MAX_JOBS=12
+  NUM_CPUS=$(( $(nproc) - 2 ))
+
+  if [[ "$(uname)" == Linux ]]; then
+    # Defaults here for **binary** linux builds so they can be changed in one place
+    export MAX_JOBS=${MAX_JOBS:-$(( ${NUM_CPUS} > ${MEMORY_LIMIT_MAX_JOBS} ? ${MEMORY_LIMIT_MAX_JOBS} : ${NUM_CPUS} ))}
+  else
+    # For other builds
+    export MAX_JOBS=${NUM_CPUS}
+  fi
+
+  cat >>"$envfile" <<EOL
+  export MAX_JOBS="${MAX_JOBS}"
+EOL
+fi
 
 echo 'retry () {' >> "$envfile"
 echo '    $*  || (sleep 1 && $*) || (sleep 2 && $*) || (sleep 4 && $*) || (sleep 8 && $*)' >> "$envfile"

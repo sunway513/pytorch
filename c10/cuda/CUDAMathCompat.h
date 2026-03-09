@@ -6,6 +6,7 @@
 #if defined(__CUDACC__) || defined(__HIPCC__)
 
 #include <c10/macros/Macros.h>
+#include <c10/util/Exception.h>
 
 #ifdef __HIPCC__
 #define __MATH_FUNCTIONS_DECL__ inline C10_DEVICE
@@ -13,13 +14,11 @@
 #ifdef __CUDACC_RTC__
 #define __MATH_FUNCTIONS_DECL__ C10_HOST_DEVICE
 #else /* __CUDACC_RTC__ */
-#define __MATH_FUNCTIONS_DECL__ static inline C10_HOST_DEVICE
+#define __MATH_FUNCTIONS_DECL__ inline C10_HOST_DEVICE
 #endif /* __CUDACC_RTC__ */
 #endif /* __HIPCC__ */
 
-namespace c10 {
-namespace cuda {
-namespace compat {
+namespace c10::cuda::compat {
 
 __MATH_FUNCTIONS_DECL__ float abs(float x) {
   return ::fabsf(x);
@@ -40,6 +39,27 @@ __MATH_FUNCTIONS_DECL__ float ceil(float x) {
 }
 __MATH_FUNCTIONS_DECL__ double ceil(double x) {
   return ::ceil(x);
+}
+
+__MATH_FUNCTIONS_DECL__ float copysign(float x, float y) {
+#if defined(__CUDA_ARCH__) || defined(__HIPCC__)
+  return ::copysignf(x, y);
+#else
+  // std::copysign gets ICE/Segfaults with gcc 7.5/8 on arm64
+  // (e.g. Jetson), see PyTorch PR #51834
+  // This host function needs to be here for the compiler but is never used
+  TORCH_INTERNAL_ASSERT(
+      false, "CUDAMathCompat copysign should not run on the CPU");
+#endif
+}
+__MATH_FUNCTIONS_DECL__ double copysign(double x, double y) {
+#if defined(__CUDA_ARCH__) || defined(__HIPCC__)
+  return ::copysign(x, y);
+#else
+  // see above
+  TORCH_INTERNAL_ASSERT(
+      false, "CUDAMathCompat copysign should not run on the CPU");
+#endif
 }
 
 __MATH_FUNCTIONS_DECL__ float floor(float x) {
@@ -127,8 +147,6 @@ __MATH_FUNCTIONS_DECL__ double normcdf(double x) {
   return ::normcdf(x);
 }
 
-} // namespace compat
-} // namespace cuda
-} // namespace c10
+} // namespace c10::cuda::compat
 
 #endif

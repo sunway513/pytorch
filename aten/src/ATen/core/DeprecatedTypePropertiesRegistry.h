@@ -5,27 +5,29 @@
 
 #include <c10/core/Backend.h>
 #include <c10/core/ScalarType.h>
+#include <memory>
 
 namespace at {
 
 class DeprecatedTypeProperties;
 
-struct CAFFE2_API DeprecatedTypePropertiesDeleter {
+struct TORCH_API DeprecatedTypePropertiesDeleter {
   void operator()(DeprecatedTypeProperties * ptr);
 };
 
-class CAFFE2_API DeprecatedTypePropertiesRegistry {
+class TORCH_API DeprecatedTypePropertiesRegistry {
  public:
   DeprecatedTypePropertiesRegistry();
 
   DeprecatedTypeProperties& getDeprecatedTypeProperties(Backend p, ScalarType s) const;
 
 private:
+  // NOLINTNEXTLINE(*c-array*)
   std::unique_ptr<DeprecatedTypeProperties> registry
     [static_cast<int>(Backend::NumOptions)]
     [static_cast<int>(ScalarType::NumOptions)];
 };
 
-CAFFE2_API DeprecatedTypePropertiesRegistry& globalDeprecatedTypePropertiesRegistry();
+TORCH_API DeprecatedTypePropertiesRegistry& globalDeprecatedTypePropertiesRegistry();
 
 } // namespace at

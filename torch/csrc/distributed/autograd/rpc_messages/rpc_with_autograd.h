@@ -4,9 +4,7 @@
 #include <torch/csrc/distributed/rpc/rpc_agent.h>
 #include <torch/csrc/distributed/rpc/rpc_command_base.h>
 
-namespace torch {
-namespace distributed {
-namespace autograd {
+namespace torch::distributed::autograd {
 
 // Represents an RPC that includes autograd information. This class basically
 // wraps another `RpcCommandBase` object which represents the actual RPC and has
@@ -18,7 +16,8 @@ class TORCH_API RpcWithAutograd final : public rpc::RpcCommandBase {
       rpc::worker_id_t fromWorkerId,
       rpc::MessageType messageType,
       const AutogradMetadata& autogradMetadata,
-      rpc::Message&& wrappedMessage);
+      c10::intrusive_ptr<rpc::Message> wrappedMessage,
+      rpc::DeviceMap deviceMap = {});
 
   // Used when receiving an RPC over the wire.
   RpcWithAutograd(
@@ -27,9 +26,10 @@ class TORCH_API RpcWithAutograd final : public rpc::RpcCommandBase {
       const AutogradMetadata& autogradMetadata,
       std::unique_ptr<rpc::RpcCommandBase> wrappedRpc,
       rpc::MessageType wrappedMessageType,
-      std::vector<torch::Tensor> tensors);
+      std::vector<torch::Tensor> tensors,
+      rpc::DeviceMap deviceMap = {});
 
-  rpc::Message toMessageImpl() && override;
+  c10::intrusive_ptr<rpc::Message> toMessageImpl() && override;
 
   static std::unique_ptr<RpcWithAutograd> fromMessage(
       const rpc::Message& message);
@@ -51,6 +51,9 @@ class TORCH_API RpcWithAutograd final : public rpc::RpcCommandBase {
 
   // Retrieve the worker id from which the RPC originated.
   rpc::worker_id_t fromWorkerId() const;
+
+  // Retrieve the device map.
+  const rpc::DeviceMap& deviceMap();
 
  private:
   // WorkerId from which this RPC originated. This is necessary for knowing
@@ -75,7 +78,7 @@ class TORCH_API RpcWithAutograd final : public rpc::RpcCommandBase {
   // avoid serializing the request twice.
   // When receive rpcWithAutograd is constructed fromMessage, it is nullptr;
   // When send rpcWithAutograd is constructed before toMessage, it is valid;
-  rpc::Message wrappedMessage_;
+  c10::intrusive_ptr<rpc::Message> wrappedMessage_;
 
   // message type of the wrappedMessage, this is stored separately since
   // wrappedMessage_ is not always guaranteed to be populated.
@@ -83,8 +86,9 @@ class TORCH_API RpcWithAutograd final : public rpc::RpcCommandBase {
 
   // Tensors part of the wrappedRpc that need to be considered for autograd.
   std::vector<torch::Tensor> tensors_;
+
+  // Device mapping for tensors that are sent across an RPC to another node.
+  rpc::DeviceMap deviceMap_;
 };
 
-} // namespace autograd
-} // namespace distributed
-} // namespace torch
+} // namespace torch::distributed::autograd

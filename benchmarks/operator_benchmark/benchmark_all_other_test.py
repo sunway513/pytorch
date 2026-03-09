@@ -1,16 +1,47 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-from __future__ import unicode_literals
+from pt import (  # noqa: F401
+    add_test,
+    ao_sparsifier_test,
+    arange_test,
+    as_strided_test,
+    batchnorm_test,
+    binary_inplace_test,
+    binary_test,
+    bmm_test,
+    boolean_test,
+    cat_test,
+    channel_shuffle_test,
+    chunk_test,
+    conv_test,
+    diag_test,
+    embeddingbag_test,
+    fill_test,
+    gather_test,
+    groupnorm_test,
+    hardsigmoid_test,
+    hardswish_test,
+    index_add__test,
+    index_select_test,
+    instancenorm_test,
+    interpolate_test,
+    layernorm_test,
+    linear_test,
+    matmul_test,
+    mm_test,
+    nan_to_num_test,
+    pool_test,
+    remainder_test,
+    softmax_test,
+    split_test,
+    stack_test,
+    sum_test,
+    tensor_to_test,
+    ternary_test,
+    topk_test,
+    where_test,
+)
 
 import operator_benchmark as op_bench
-from pt import ( # noqa
-    add_test, as_strided_test, batchnorm_test, binary_test, cat_test,  # noqa
-    chunk_test, conv_test, diag_test, embeddingbag_test, fill_test,  # noqa
-    gather_test, linear_test, matmul_test, pool_test,  # noqa
-    softmax_test, hardsigmoid_test, hardswish_test, layernorm_test,  # noqa
-    groupnorm_test, instancenorm_test # noqa
-)
+
 
 if __name__ == "__main__":
     op_bench.benchmark_runner.main()

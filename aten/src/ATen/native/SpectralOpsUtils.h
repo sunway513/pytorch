@@ -3,13 +3,25 @@
 #include <string>
 #include <stdexcept>
 #include <sstream>
+#include <c10/core/ScalarType.h>
+#include <c10/util/ArrayRef.h>
+#include <c10/util/Exception.h>
+#include <ATen/native/DispatchStub.h>
+#include <ATen/core/TensorBase.h>
 
-namespace at { namespace native {
+namespace at::native {
+
+// Normalization types used in _fft_with_size
+enum class fft_norm_mode {
+  none,       // No normalization
+  by_root_n,  // Divide by sqrt(signal_size)
+  by_n,       // Divide by signal_size
+};
 
 // NOTE [ Fourier Transform Conjugate Symmetry ]
 //
 // Real-to-complex Fourier transform satisfies the conjugate symmetry. That is,
-// assuming X is the transformed K-dimensionsal signal, we have
+// assuming X is the transformed K-dimensional signal, we have
 //
 //     X[i_1, ..., i_K] = X[j_i, ..., j_K]*,
 //
@@ -51,8 +63,22 @@ inline int64_t infer_ft_complex_to_real_onesided_size(int64_t complex_size,
     std::ostringstream ss;
     ss << "expected real signal size " << expected_size << " is incompatible "
        << "with onesided complex frequency size " << complex_size;
-    AT_ERROR(ss.str());
+    TORCH_CHECK(false, ss.str());
   }
 }
 
-}} // at::native
+using fft_fill_with_conjugate_symmetry_fn =
+    void (*)(ScalarType dtype, IntArrayRef mirror_dims, IntArrayRef half_sizes,
+             IntArrayRef in_strides, const void* in_data,
+             IntArrayRef out_strides, void* out_data);
+DECLARE_DISPATCH(fft_fill_with_conjugate_symmetry_fn, fft_fill_with_conjugate_symmetry_stub)
+
+// In real-to-complex transform, cuFFT and MKL only fill half of the values
+// due to conjugate symmetry. This function fills in the other half of the full
+// fft by using the Hermitian symmetry in the signal.
+// self should be the shape of the full signal and dims.back() should be the
+// one-sided dimension.
+// See NOTE [ Fourier Transform Conjugate Symmetry ]
+TORCH_API void _fft_fill_with_conjugate_symmetry_(const Tensor& self, IntArrayRef dims);
+
+} // namespace at::native

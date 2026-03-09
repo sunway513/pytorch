@@ -1,8 +1,10 @@
-
+#include <c10/util/irange.h>
 #include <torch/csrc/jit/runtime/argument_spec.h>
 
-namespace torch {
-namespace jit {
+#include <array>
+#include <iostream>
+
+namespace torch::jit {
 
 void ArgumentSpecCreator::scan(
     const TypePtr& typ,
@@ -29,10 +31,10 @@ void ArgumentSpecCreator::scan(
   if (depth >= ARG_SPEC_DEPTH_LIMIT) {
     instructions_.emplace_back(SKIP);
   }
-  if (typ->isSubtypeOf(TensorType::get())) {
+  if (typ->isSubtypeOf(*TensorType::get())) {
     num_tensors_++;
     instructions_.emplace_back(SPECIALIZE_TENSOR);
-  } else if (typ->isSubtypeOf(OptionalType::ofTensor())) {
+  } else if (typ->isSubtypeOf(*OptionalType::ofTensor())) {
     num_tensors_++;
     num_optionals_++;
     instructions_.emplace_back(SPECIALIZE_OPTIONAL_TENSOR);
@@ -65,7 +67,7 @@ void ArgumentSpecCreator::scan(
   } else {
     instructions_.emplace_back(SKIP);
   }
-};
+}
 
 // this is a coarse-grained guarantee that the slots of a class will not be
 // modified by the function. It works fine for things that used be read-only
@@ -125,13 +127,14 @@ void ArgumentSpecCreator::dump() const {
         break;
     }
   }
-  std::cout << "\n";
+  std::cout << '\n';
 }
 
 ArgumentSpec ArgumentSpecCreator::create(bool with_grad, const Stack& input)
     const {
   ArgumentSpec spec(num_tensors_, num_optionals_);
-  const IValue* stack[ARG_SPEC_DEPTH_LIMIT]; // The stack of IValue lists
+  std::array<const IValue*, ARG_SPEC_DEPTH_LIMIT>
+      stack{}; // The stack of IValue lists
   // The stack gets initialized with the input list
   stack[0] = last(input, num_inputs_).begin();
   size_t stack_top = 0; // offset to the top of the stack
@@ -263,7 +266,7 @@ void ArgumentSpecCreator::specializeTypes(
   //        to investigate the uses of the inputs in detail to change the
   //        accesses/ unwrapping
   auto inputs = graph.inputs();
-  for (size_t i = 0; i < inputs.size(); ++i) {
+  for (const auto i : c10::irange(inputs.size())) {
     auto t = result_stack.back()[i];
     if (auto ot = t->cast<OptionalType>()) {
       // if an optional input hasn't been specialized above, it is None
@@ -278,5 +281,4 @@ void ArgumentSpecCreator::specializeTypes(
   }
 }
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

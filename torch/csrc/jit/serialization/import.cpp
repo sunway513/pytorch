@@ -1,99 +1,105 @@
-#include <torch/csrc/jit/serialization/import.h>
-#include <ATen/core/functional.h>
-#include <c10/util/Exception.h>
-#include <torch/csrc/jit/serialization/import_export_helpers.h>
-#ifndef C10_MOBILE
-#include <torch/csrc/jit/serialization/import_legacy.h>
-#endif
-#include <torch/csrc/jit/frontend/script_type_parser.h>
-#include <torch/csrc/jit/ir/ir.h>
-#include <torch/csrc/jit/passes/subgraph_rewrite.h>
-#include <torch/csrc/jit/serialization/import_source.h>
-#include <torch/csrc/jit/serialization/pickle.h>
-#include <torch/csrc/jit/serialization/source_range_serialization.h>
-#include <torch/csrc/jit/serialization/unpickler.h>
-
+#include <ATen/core/interned_strings.h>
 #include <caffe2/serialize/file_adapter.h>
+#include <caffe2/serialize/in_memory_adapter.h>
 #include <caffe2/serialize/inline_container.h>
 #include <caffe2/serialize/istream_adapter.h>
+#include <caffe2/serialize/read_adapter_interface.h>
+
+#include <torch/csrc/jit/api/compilation_unit.h>
+
+#include <ATen/core/functional.h>
+#include <ATen/core/ivalue_inl.h>
+#include <c10/util/Exception.h>
+#include <c10/util/irange.h>
+#include <torch/csrc/jit/frontend/script_type_parser.h>
+#include <torch/csrc/jit/ir/graph_utils.h>
+#include <torch/csrc/jit/ir/ir.h>
+#include <torch/csrc/jit/mobile/file_format.h>
+#include <torch/csrc/jit/mobile/flatbuffer_loader.h>
+#include <torch/csrc/jit/operator_upgraders/upgraders_entry.h>
+#include <torch/csrc/jit/passes/shape_analysis.h>
+#include <torch/csrc/jit/passes/subgraph_rewrite.h>
+#include <torch/csrc/jit/serialization/import.h>
+#include <torch/csrc/jit/serialization/import_export_helpers.h>
+#include <torch/csrc/jit/serialization/import_read.h>
+#include <torch/csrc/jit/serialization/import_source.h>
+#include <torch/csrc/jit/serialization/source_range_serialization.h>
+#include <torch/csrc/jit/serialization/unpickler.h>
 
 #include <ATen/ATen.h>
 #include <fmt/format.h>
 
-#include <fstream>
 #include <string>
-#include <unordered_map>
+#include <utility>
 #include <vector>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
-using caffe2::serialize::FileAdapter;
-using caffe2::serialize::IStreamAdapter;
+using caffe2::serialize::MemoryReadAdapter;
 using caffe2::serialize::PyTorchStreamReader;
 using caffe2::serialize::ReadAdapterInterface;
 
-void postSetStateValidate(const IValue& v) {
+static void postSetStateValidate(const IValue& v) {
   auto obj = v.toObject();
   const auto& objType = obj->type();
-  for (size_t i = 0; i < objType->numAttributes(); i++) {
+  for (const auto i : c10::irange(objType->numAttributes())) {
     const auto& attrType = objType->getAttribute(i);
+#ifndef STRIP_ERROR_MESSAGES
     const auto& attrName = objType->getAttributeName(i);
+#endif
     const auto& slot = obj->getSlot(i);
     // const auto attrType = objType->getAttribute(i);
     // Verify that all the non-optional attributes have been initialized
     // TODO: Issue #20497
-    if (attrType->kind() != TypeKind::OptionalType) {
+    if (attrType->kind() != TypeKind::UnionType &&
+        attrType->kind() != TypeKind::OptionalType &&
+        attrType->kind() != TypeKind::NoneType) {
       TORCH_CHECK(
           !slot.isNone(),
           fmt::format(
               "The field '{}' was left uninitialized after '__setstate__', "
               "but expected a value of type '{}'",
               attrName,
-              attrType->python_str()));
+              attrType->repr_str()));
     }
   }
 }
 
-IValue readArchiveAndTensors(
-    const std::string& archive_name,
-    c10::optional<TypeResolver> type_resolver,
-    c10::optional<ObjLoader> obj_loader,
-    c10::optional<at::Device> device,
-    PyTorchStreamReader& stream_reader) {
-  std::string picklename = archive_name + ".pkl";
-  at::DataPtr pickle_ptr;
-  size_t pickle_size;
-  std::tie(pickle_ptr, pickle_size) = stream_reader.getRecord(picklename);
-
-  size_t bytes_read = 0;
-  auto data = reinterpret_cast<const char*>(pickle_ptr.get());
-  auto reader = [&](char* buffer, size_t len) -> size_t {
-    if (bytes_read >= pickle_size) {
-      return 0;
+// Decouple how to get obj from type. In this file it's dependent on
+// Method.run() and graph executor, etc.
+// For bytecode import we need to decouple these dependencies.
+c10::intrusive_ptr<c10::ivalue::Object> ObjLoaderFunc(
+    const at::StrongTypePtr& type,
+    IValue input) {
+  const auto& cls = type.type_->expectRef<at::ClassType>();
+  auto qn = cls.name();
+  size_t n = cls.numAttributes();
+  if (checkHasValidSetGetState(cls)) {
+    auto obj = c10::ivalue::Object::create(type, n);
+    // XXX: Do not optimize __setstate__, so that we don't try to
+    // specialize the class before it is initialized.
+    GraphOptimizerEnabledGuard guard(false);
+    Function& set_state = cls.getMethod("__setstate__");
+    // since we are in the middle of unpickling we might still have lists and
+    // dicts that do not have accurate tags (e.g. they report they are
+    // List[Any]). But we need to run __setstate__ which will check the input
+    // type and may access the tags. Since setstate has a known input type, we
+    // can correctly restore the tags now by apply the input type of set_state
+    // to the state object being passed.
+    // TODO: Remove once [serialization type tags] is landed
+    restoreAccurateTypeTags(
+        input, set_state.getSchema().arguments().at(1).type());
+    set_state({obj, input});
+    postSetStateValidate(obj);
+    return obj;
+  } else {
+    auto dict = std::move(input).toGenericDict();
+    auto obj = c10::ivalue::Object::create(type, n);
+    for (const auto i : c10::irange(n)) {
+      obj->setSlot(i, dict.at(cls.getAttributeName(i)));
     }
-    len = std::min(pickle_size - bytes_read, len);
-    // Copy len bytes into buffer
-    const char* start = data + bytes_read;
-    std::memcpy(buffer, start, len);
-    bytes_read += len;
-    return len;
-  };
-
-  std::string archive_name_plus_slash = archive_name + "/";
-  auto read_record = [&](const std::string& name) {
-    std::string ss = archive_name_plus_slash + name;
-    return std::get<0>(stream_reader.getRecord(ss));
-  };
-
-  Unpickler unpickler(
-      reader,
-      type_resolver ? std::move(*type_resolver) : nullptr,
-      obj_loader ? std::move(*obj_loader) : nullptr,
-      std::move(read_record),
-      device);
-  unpickler.set_version(stream_reader.version());
-  return unpickler.parse_ivalue();
+    return obj;
+  }
 }
 
 namespace {
@@ -107,31 +113,58 @@ class ScriptModuleDeserializer final {
  public:
   ScriptModuleDeserializer(
       std::shared_ptr<CompilationUnit> cu,
-      std::unique_ptr<PyTorchStreamReader> reader)
-      : compilation_unit_(cu),
+      std::shared_ptr<PyTorchStreamReader> reader)
+      : compilation_unit_(std::move(cu)),
         reader_(std::move(reader)),
+        code_prefix_("code/"),
+
         source_importer_(
             compilation_unit_,
             &constants_table_,
             [this](const std::string& qualifier) {
               return findSourceInArchiveFromQualifier(
-                  *reader_, export_prefix_, qualifier);
+                  *reader_, code_prefix_, qualifier);
+            },
+            reader_->version()) {}
+
+  ScriptModuleDeserializer(
+      std::shared_ptr<CompilationUnit> cu,
+      std::shared_ptr<PyTorchStreamReader> reader,
+      std::string pickle_dir_prefix,
+      std::string tensor_dir_prefix,
+      std::shared_ptr<DeserializationStorageContext> storage_context)
+      : compilation_unit_(std::move(cu)),
+        reader_(std::move(reader)),
+        storage_context_(std::move(storage_context)),
+        code_prefix_(".data/ts_code/code/"),
+        pickle_dir_prefix_(std::move(pickle_dir_prefix)),
+        tensor_dir_prefix_(std::move(tensor_dir_prefix)),
+        source_importer_(
+            compilation_unit_,
+            &constants_table_,
+            [this](const std::string& qualifier) {
+              return findSourceInArchiveFromQualifier(
+                  *reader_, code_prefix_, qualifier);
             },
             reader_->version()) {}
 
   Module deserialize(
-      c10::optional<at::Device> device,
-      ExtraFilesMap& extra_files);
+      std::optional<at::Device> device,
+      ExtraFilesMap& extra_files,
+      bool restore_shapes = false);
 
  private:
   IValue readArchive(const std::string& archive_name);
 
   std::shared_ptr<CompilationUnit> compilation_unit_;
-  std::unique_ptr<PyTorchStreamReader> reader_;
-  c10::optional<at::Device> device_;
-  std::vector<at::Tensor> constants_table_;
+  std::shared_ptr<PyTorchStreamReader> reader_;
+  std::shared_ptr<DeserializationStorageContext> storage_context_;
+  std::optional<at::Device> device_;
+  std::vector<at::IValue> constants_table_;
+  std::string code_prefix_;
+  std::string pickle_dir_prefix_;
+  std::string tensor_dir_prefix_;
   SourceImporter source_importer_;
-  std::string export_prefix_ = "code/";
 };
 
 IValue ScriptModuleDeserializer::readArchive(const std::string& archive_name) {
@@ -140,43 +173,16 @@ IValue ScriptModuleDeserializer::readArchive(const std::string& archive_name) {
     return c10::StrongTypePtr(compilation_unit_, std::move(cls));
   };
 
-  // Decouple how to get obj from type. In this file it's dependent on
-  // Method.run() and graph executor, etc.
-  // For bytecode import we need to decouple these dependencies.
-  auto obj_loader = [&](at::StrongTypePtr type, IValue input) {
-    auto cls = type.type_->expect<at::ClassType>();
-    auto qn = cls->name();
-    size_t n = cls->numAttributes();
-    if (checkHasValidSetGetState(cls)) {
-      auto obj = c10::ivalue::Object::create(type, n);
-      // XXX: Do not optimize __setstate__, so that we don't try to
-      // specialize the class before it is initialized.
-      GraphOptimizerEnabledGuard guard(false);
-      Function& set_state = cls->getMethod("__setstate__");
-      // since we are in the middle of unpickling we might still have lists and
-      // dicts that do not have accurate tags (e.g. they report they are
-      // List[Any]). But we need to run __setstate__ which will check the input
-      // type and may access the tags. Since setstate has a known input type, we
-      // can correctly restore the tags now by apply the input type of set_state
-      // to the state object being passed.
-      // TODO: Remove once [serialization type tags] is landed
-      restoreAccurateTypeTags(
-          input, set_state.getSchema().arguments().at(1).type());
-      set_state({obj, input});
-      postSetStateValidate(obj);
-      return obj;
-    } else {
-      auto dict = std::move(input).toGenericDict();
-      auto obj = c10::ivalue::Object::create(type, n);
-      for (size_t i = 0; i < n; ++i) {
-        obj->setSlot(i, dict.at(cls->getAttributeName(i)));
-      }
-      return obj;
-    }
-  };
-
   return readArchiveAndTensors(
-      archive_name, type_resolver, obj_loader, device_, *reader_.get());
+      /*archive_name=*/archive_name,
+      /*pickle_prefix=*/pickle_dir_prefix_,
+      /*tensor_prefix=*/tensor_dir_prefix_,
+      type_resolver,
+      ObjLoaderFunc,
+      device_,
+      *reader_,
+      nullptr,
+      storage_context_);
 }
 
 void rewriteQuantizedConvForBC(const Module& module) {
@@ -239,119 +245,368 @@ graph(%x, %packed_params, %stride, %padding, %dilation, %groups, %r_scale, %r_ze
 }
 
 Module ScriptModuleDeserializer::deserialize(
-    c10::optional<at::Device> device,
-    ExtraFilesMap& extra_files) {
-  C10_LOG_API_USAGE_ONCE("torch.script.load");
+    std::optional<at::Device> device,
+    ExtraFilesMap& extra_files,
+    bool restore_shapes) {
+  // we populate the upgraders map before any load starts
+  populate_upgraders_graph_map();
+
+  C10_LOG_API_USAGE_ONCE("torch.jit.load");
   device_ = device;
   // Load extra files.
   for (const auto& kv : extra_files) {
     const std::string& key = "extra/" + kv.first;
     if (reader_->hasRecord(key)) {
-      at::DataPtr meta_ptr;
-      size_t meta_size;
-      std::tie(meta_ptr, meta_size) = reader_->getRecord(key);
+      auto [meta_ptr, meta_size] = reader_->getRecord(key);
       extra_files[kv.first] =
           std::string(static_cast<char*>(meta_ptr.get()), meta_size);
     }
   }
-  if (reader_->hasRecord("model.json")) {
-#ifndef C10_MOBILE
-    return torch::jit::LEGACY_deserialize(
-        compilation_unit_, std::move(reader_), device_);
-#else
-    AT_ERROR("Legacy model format is not supported on mobile.");
-#endif
+  if (reader_->hasRecord("model.json") && code_prefix_ == "code/") {
+    TORCH_CHECK(false, "Legacy model format is not supported on mobile.");
   }
   auto tuple = readArchive("constants").toTuple();
   for (auto constant : tuple->elements()) {
-    constants_table_.push_back(constant.toTensor());
+    constants_table_.push_back(constant.toIValue());
   }
-  auto m = Module(readArchive("data").toObject());
+  auto m_ivalue = readArchive("data");
+  auto m = Module(m_ivalue.toObject());
   rewriteQuantizedConvForBC(m);
+  // Checking for and loading saved traced inputs
+  if (restore_shapes && reader_->hasRecord("traced_inputs.pkl")) {
+    auto dict = readArchive("traced_inputs").toGenericDict();
+    for (const auto& entry : dict) {
+      auto inputs = entry.value().toList().vec();
+      auto g =
+          toGraphFunction(m.get_method(entry.key().toStringRef()).function())
+              .graph();
+      Stack stack(inputs.begin(), inputs.end());
+      // Added the module as the first input if we are missing
+      // an input as traced modules refer to self as an additional input
+      if (g->inputs().size() == stack.size() + 1) {
+        stack.insert(stack.begin(), m_ivalue);
+      }
+      setInputTensorTypes(*g, stack, /*complete=*/true);
+      PropagateInputShapes(g);
+    }
+  } else {
+    if (restore_shapes) {
+      TORCH_WARN("Cannot restore shapes as no traced inputs were stored");
+    }
+  }
+  c10::LogAPIUsageMetadata(
+      "torch.script.load.metadata",
+      {{"serialization_id", reader_->serializationId()}});
   return m;
 }
-
 } // namespace
 
 Module import_ir_module(
     std::shared_ptr<CompilationUnit> cu,
     std::istream& in,
-    c10::optional<at::Device> device,
-    ExtraFilesMap& extra_files) {
-  auto reader = torch::make_unique<PyTorchStreamReader>(&in);
-  ScriptModuleDeserializer deserializer(std::move(cu), std::move(reader));
+    std::optional<at::Device> device,
+    bool load_debug_files) {
+  ExtraFilesMap extra_files;
+  return import_ir_module(
+      std::move(cu), in, device, extra_files, load_debug_files);
+}
+
+static Module _load_jit_module_from_bytes(
+    const std::shared_ptr<char>& data,
+    size_t size,
+    std::shared_ptr<CompilationUnit> cu,
+    std::optional<c10::Device> device,
+    ExtraFilesMap& extra_files,
+    bool restore_shapes);
+
+Module parse_and_initialize_jit_module(
+    const std::shared_ptr<char>& data,
+    size_t size,
+    ExtraFilesMap& extra_files,
+    std::optional<at::Device> device) {
+  populate_upgraders_graph_map();
+  ExtraFilesMap jit_files;
+  std::vector<IValue> jit_constants;
+  mobile::Module mobilem = parse_and_initialize_mobile_module_for_jit(
+      data.get(), size, jit_files, jit_constants, device, &extra_files);
+
+  Module m = jitModuleFromSourceAndConstants(
+      mobilem._ivalue(),
+      jit_files,
+      jit_constants,
+      static_cast<int32_t>(mobilem.bytecode_version()));
+  m.set_delete_memory(data);
+  return m;
+}
+
+Module load_jit_module_from_file(
+    const std::string& filename,
+    ExtraFilesMap& extra_files,
+    std::optional<at::Device> device) {
+  auto data = get_file_content(filename.c_str());
+  return parse_and_initialize_jit_module(
+      std::get<0>(data), std::get<1>(data), extra_files, device);
+}
+
+Module load_jit_module_from_stream(
+    std::istream& in,
+    ExtraFilesMap& extra_files,
+    std::optional<at::Device> device) {
+  auto data = get_stream_content(in);
+  return parse_and_initialize_jit_module(
+      std::get<0>(data), std::get<1>(data), extra_files, device);
+}
+
+Module import_ir_module(
+    std::shared_ptr<CompilationUnit> cu,
+    std::istream& in,
+    std::optional<at::Device> device,
+    ExtraFilesMap& extra_files,
+    bool load_debug_files,
+    bool restore_shapes) {
+  in.seekg(0, in.beg);
+  // NOTE: Zipformat can be large files. So using stream version directly
+  // instead of reading the file all at once.
+  if (getFileFormat(in) != FileFormat::FlatbufferFileFormat) {
+    auto reader = std::make_unique<PyTorchStreamReader>(&in);
+    reader->setShouldLoadDebugSymbol(load_debug_files);
+    ScriptModuleDeserializer deserializer(std::move(cu), std::move(reader));
+    return deserializer.deserialize(device, extra_files, restore_shapes);
+  }
+  auto [data, size] = get_stream_content(in);
+  return _load_jit_module_from_bytes(
+      data, size, cu, device, extra_files, restore_shapes);
+}
+
+// For reading unified serialization format from torch.Package.
+Module import_ir_module(
+    std::shared_ptr<CompilationUnit> cu,
+    std::shared_ptr<PyTorchStreamReader> reader,
+    std::shared_ptr<DeserializationStorageContext> storage_context,
+    std::optional<at::Device> device,
+    const std::string& ts_id) {
+  ScriptModuleDeserializer deserializer(
+      std::move(cu),
+      std::move(reader),
+      /* pickle_dir_prefix = */ ".data/ts_code/" + ts_id + "/",
+      /* tensor_dir_prefix = */ ".data/",
+      std::move(storage_context));
+  ExtraFilesMap extra_files;
   return deserializer.deserialize(device, extra_files);
 }
 
 Module import_ir_module(
     std::shared_ptr<CompilationUnit> cu,
     const std::string& filename,
-    c10::optional<at::Device> device,
-    ExtraFilesMap& extra_files) {
-  auto reader = torch::make_unique<PyTorchStreamReader>(filename);
-  ScriptModuleDeserializer deserializer(std::move(cu), std::move(reader));
-  return deserializer.deserialize(device, extra_files);
+    std::optional<at::Device> device,
+    bool load_debug_files) {
+  ExtraFilesMap extra_files;
+  return import_ir_module(
+      std::move(cu), filename, device, extra_files, load_debug_files);
+}
+
+Module import_ir_module(
+    std::shared_ptr<CompilationUnit> cu,
+    const std::string& filename,
+    std::optional<at::Device> device,
+    ExtraFilesMap& extra_files,
+    bool load_debug_files,
+    bool restore_shapes) {
+  // NOTE: Zipformat can be large files. So using stream version directly
+  // instead of reading the file all at once.
+  if (getFileFormat(filename) != FileFormat::FlatbufferFileFormat) {
+    auto reader = std::make_unique<PyTorchStreamReader>(filename);
+    reader->setShouldLoadDebugSymbol(load_debug_files);
+    ScriptModuleDeserializer deserializer(std::move(cu), std::move(reader));
+    return deserializer.deserialize(device, extra_files, restore_shapes);
+  }
+  auto [data, size] = get_file_content(filename.c_str());
+  return _load_jit_module_from_bytes(
+      data, size, cu, device, extra_files, restore_shapes);
 }
 
 Module import_ir_module(
     std::shared_ptr<CompilationUnit> cu,
     std::unique_ptr<ReadAdapterInterface> rai,
-    c10::optional<at::Device> device,
-    ExtraFilesMap& extra_files) {
-  auto reader = torch::make_unique<PyTorchStreamReader>(std::move(rai));
+    std::optional<at::Device> device,
+    bool load_debug_files) {
+  ExtraFilesMap extra_files;
+  return import_ir_module(
+      std::move(cu), std::move(rai), device, extra_files, load_debug_files);
+}
+
+Module import_ir_module(
+    std::shared_ptr<CompilationUnit> cu,
+    std::unique_ptr<ReadAdapterInterface> rai,
+    std::optional<at::Device> device,
+    ExtraFilesMap& extra_files,
+    bool load_debug_files) {
+  std::shared_ptr<ReadAdapterInterface> rai_shared = std::move(rai);
+  return import_ir_module(
+      std::move(cu), rai_shared, device, extra_files, load_debug_files);
+}
+
+Module import_ir_module(
+    std::shared_ptr<CompilationUnit> cu,
+    std::shared_ptr<ReadAdapterInterface> rai,
+    std::optional<at::Device> device,
+    ExtraFilesMap& extra_files,
+    bool load_debug_files) {
+  auto reader = std::make_shared<PyTorchStreamReader>(std::move(rai));
+  reader->setShouldLoadDebugSymbol(load_debug_files);
   ScriptModuleDeserializer deserializer(std::move(cu), std::move(reader));
   return deserializer.deserialize(device, extra_files);
 }
 
 Module load(
     std::istream& in,
-    c10::optional<at::Device> device,
-    ExtraFilesMap& extra_files) {
-  std::unique_ptr<IStreamAdapter> rai = std::make_unique<IStreamAdapter>(&in);
-  auto module = load(std::move(rai), device, extra_files);
-  return module;
+    std::optional<at::Device> device,
+    bool load_debug_files) {
+  auto cu = std::make_shared<CompilationUnit>();
+  return import_ir_module(std::move(cu), in, device, load_debug_files);
+}
+
+Module load(
+    std::istream& in,
+    std::optional<at::Device> device,
+    ExtraFilesMap& extra_files,
+    bool load_debug_files) {
+  auto cu = std::make_shared<CompilationUnit>();
+  return import_ir_module(
+      std::move(cu), in, device, extra_files, load_debug_files);
 }
 
 Module load(
     const std::string& filename,
-    c10::optional<at::Device> device,
-    ExtraFilesMap& extra_files) {
-  std::unique_ptr<FileAdapter> rai = std::make_unique<FileAdapter>(filename);
-  auto module = load(std::move(rai), device, extra_files);
-  return module;
+    std::optional<at::Device> device,
+    bool load_debug_files) {
+  auto cu = std::make_shared<CompilationUnit>();
+  return import_ir_module(std::move(cu), filename, device, load_debug_files);
 }
 
 Module load(
-    std::unique_ptr<ReadAdapterInterface> rai,
-    c10::optional<c10::Device> device,
-    ExtraFilesMap& extra_files) {
-  // Verify that we're loading a zip archive and not a torch.save pickle archive
-  // (marked by the 0x80 0x02 bytes at the start)
-  uint8_t first_short[2];
-  rai->read(
-      /*pos=*/0,
-      /*buf=*/&first_short,
-      /*n=*/2,
-      /*what=*/"checking archive");
-  if (first_short[0] == 0x80 && first_short[1] == 0x02) {
-    // NB: zip files by spec can start with any data, so technically they might
-    // start with 0x80 0x02, but in practice zip files start with a file entry
-    // which begins with 0x04034b50. Furthermore, PyTorch will never produce zip
-    // files that do not start with the file entry, so it is relatively safe to
-    // perform this check.
-    TORCH_CHECK(
-        false,
-        "`torch::jit::load()` received a file from `torch.save()`, "
-        "but `torch::jit::load()` can only load files"
-        " produced by `torch.jit.save()`");
-  }
-
-  auto reader = torch::make_unique<PyTorchStreamReader>(std::move(rai));
+    const std::string& filename,
+    std::optional<at::Device> device,
+    ExtraFilesMap& extra_files,
+    bool load_debug_files) {
   auto cu = std::make_shared<CompilationUnit>();
-
-  ScriptModuleDeserializer deserializer(std::move(cu), std::move(reader));
-  return deserializer.deserialize(device, extra_files);
+  return import_ir_module(
+      std::move(cu), filename, device, extra_files, load_debug_files);
 }
 
-} // namespace jit
-} // namespace torch
+Module load(
+    std::shared_ptr<ReadAdapterInterface> rai,
+    std::optional<c10::Device> device,
+    bool load_debug_files) {
+  auto cu = std::make_shared<CompilationUnit>();
+  ExtraFilesMap extra_files;
+  return import_ir_module(
+      std::move(cu), std::move(rai), device, extra_files, load_debug_files);
+}
+
+Module load(
+    std::shared_ptr<ReadAdapterInterface> rai,
+    std::optional<c10::Device> device,
+    ExtraFilesMap& extra_files,
+    bool load_debug_files) {
+  auto cu = std::make_shared<CompilationUnit>();
+  return import_ir_module(
+      std::move(cu), std::move(rai), device, extra_files, load_debug_files);
+}
+
+Module _load_jit_module_from_bytes(
+    const std::shared_ptr<char>& data,
+    size_t size,
+    std::shared_ptr<CompilationUnit> cu,
+    std::optional<c10::Device> device,
+    ExtraFilesMap& extra_files,
+    bool restore_shapes) {
+  TORCH_CHECK(size >= kFileFormatHeaderSize, "Unrecognized data format");
+  auto format = getFileFormat(data.get());
+  switch (format) {
+    case FileFormat::FlatbufferFileFormat: {
+      return parse_and_initialize_jit_module(data, size, extra_files, device);
+    }
+    case FileFormat::ZipFileFormat: {
+      auto rai = std::make_unique<MemoryReadAdapter>(data.get(), size);
+      auto reader = std::make_unique<PyTorchStreamReader>(std::move(rai));
+      ScriptModuleDeserializer deserializer(std::move(cu), std::move(reader));
+      return deserializer.deserialize(device, extra_files, restore_shapes);
+    }
+
+    default:
+      TORCH_CHECK(false, "Unrecognized data format");
+  }
+}
+
+// Replace object with a newly created but equivalent object.
+// The goal is to replace object's methods. However, since object's
+// methods are attached to type; we need to replace it's type.
+// Non-objects are unchanged; however, nested structures such as list, dict
+// are also reconstructed because they might contain an object.
+static IValue recreateObject(IValue ivalue, const TypeResolver& resolver) {
+  if (ivalue.isObject()) {
+    auto obj = ivalue.toObject();
+    auto classtype_old = obj->type();
+    auto newtype = resolver(*classtype_old->name());
+    size_t n = classtype_old->numAttributes();
+    auto newobj = c10::ivalue::Object::create(newtype, n);
+    for (const auto i : c10::irange(n)) {
+      newobj->setSlot(i, recreateObject(obj->getSlot(i), resolver));
+    }
+    return newobj;
+  } else if (ivalue.isList()) {
+    auto res = c10::impl::GenericList(ivalue.type()->containedType(0));
+    for (const auto& ival : ivalue.toList()) {
+      res.emplace_back(recreateObject(ival, resolver));
+    }
+    return res;
+  } else if (ivalue.isGenericDict()) {
+    auto result = c10::impl::GenericDict(
+        ivalue.type()->containedType(0), ivalue.type()->containedType(1));
+    for (const auto& kv : ivalue.toGenericDict()) {
+      result.insert_or_assign(
+          recreateObject(kv.key(), resolver),
+          recreateObject(kv.value(), resolver));
+    }
+    return result;
+  } else if (ivalue.isTuple()) {
+    std::vector<IValue> res;
+    for (const auto& ival : ivalue.toTuple()->elements()) {
+      res.push_back(recreateObject(ival, resolver));
+    }
+    return c10::ivalue::Tuple::create(res);
+  }
+  // Leaf types are returned verbatim.
+  return ivalue;
+}
+
+Module jitModuleFromSourceAndConstants(
+    const IValue& ivalue,
+    const ExtraFilesMap& source,
+    const std::vector<IValue>& constants,
+    int32_t version) {
+  auto compilation_unit = std::make_shared<CompilationUnit>();
+  SourceImporter importer(
+      compilation_unit,
+      &constants,
+      [&source](const std::string& qualifier) -> std::shared_ptr<Source> {
+        auto source_iter = source.find(qualifier);
+        if (source_iter == source.end()) {
+          return nullptr;
+        }
+        return std::make_shared<Source>(
+            source_iter->second, qualifier, 1, nullptr, Source::COPIES_STRING);
+      },
+      version);
+  auto type_resolver = [&](const c10::QualifiedName& qn) {
+    auto cls = importer.loadType(qn);
+    return c10::StrongTypePtr(compilation_unit, std::move(cls));
+  };
+  auto newIvalue = recreateObject(ivalue, type_resolver).toObject();
+  Module m(newIvalue);
+  rewriteQuantizedConvForBC(m);
+  return m;
+}
+
+} // namespace torch::jit

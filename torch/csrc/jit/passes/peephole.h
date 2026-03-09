@@ -2,17 +2,17 @@
 
 #include <torch/csrc/jit/ir/ir.h>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
-TORCH_API void PeepholeOptimize(
+// return true if graph is modified
+TORCH_API bool PeepholeOptimize(
     const std::shared_ptr<Graph>& graph,
     bool disable_shape_peepholes = false);
-TORCH_API void PeepholeOptimize(
+// return true if graph is modified
+TORCH_API bool PeepholeOptimize(
     Block* block,
     bool disable_shape_peepholes = false);
+// return true if graph is modified
+TORCH_API bool FuseAddMM(const std::shared_ptr<Graph>& graph);
 
-TORCH_API void FuseAddMM(const std::shared_ptr<Graph>& graph);
-
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

@@ -4,26 +4,29 @@
 #include <torch/csrc/python_headers.h>
 #include <torch/csrc/utils/pybind.h>
 
-namespace torch {
-namespace distributed {
-namespace rpc {
+namespace torch::distributed::rpc {
 
+// NOLINTNEXTLINE(performance-enum-size)
 enum RRefProxyType { RPC_SYNC, RPC_ASYNC, REMOTE };
 
 // Python wrapper of an RRef shared_ptr that supports Python
 // pickle and unpickle.
-class PyRRef {
+class PYBIND11_EXPORT PyRRef {
  public:
   // The first ctor can only be called while holding GIL. See its implementation
   // for more explanations.
   explicit PyRRef(const py::object& value, const py::object& type_hint);
   explicit PyRRef(c10::intrusive_ptr<RRef> rref);
+  PyRRef(const PyRRef&) = default;
+  ~PyRRef();
 
   bool isOwner() const;
   bool confirmedByOwner() const;
   WorkerInfo owner() const;
   std::string ownerName() const;
-  py::object toHere() const;
+  py::object toHere(
+      const float timeoutSeconds =
+          torch::distributed::rpc::kUnsetRpcTimeout) const;
   py::object localValue() const;
   std::string str() const;
   py::tuple pickle() const;
@@ -43,13 +46,36 @@ class PyRRef {
 
   // create a proxy on this RRef, which can be used to launch RPC on the owner
   // of this RRef to run functions on the object referenced by this RRef.
-  py::object createRRefProxy(const RRefProxyType& mode) const;
+  py::object createRRefProxy(
+      const RRefProxyType& mode,
+      float timeoutSeconds = rpc::kUnsetRpcTimeout) const;
+
+  // get the type of the data object referenced by this RRef. Timeout argument
+  // is only used in the first invocation of this function as an argument to the
+  // RPC to the owner node of the RRef.
+  py::object getRRefType(
+      float timeout = rpc::kUnsetRpcTimeout,
+      bool blocking = true);
+
+  // Run the backward pass with the RRef as the root.
+  void backward(int64_t autogradContextId, bool retainGraph);
+
+  // Helper static function to run backward on a given rref.
+  static void backward(
+      int64_t autogradContextId,
+      bool retainGraph,
+      const c10::intrusive_ptr<RRef>& rref);
+
+  // Specialization of backward if the rref is an OwnerRRef.
+  static void backwardOwnerRRef(
+      int64_t autogradContextId,
+      bool retainGraph,
+      IValue value);
 
  private:
   c10::intrusive_ptr<RRef> rref_;
-  c10::optional<c10::intrusive_ptr<JitFuture>> profilingFuture_;
+  std::optional<c10::intrusive_ptr<JitFuture>> profilingFuture_;
+  std::optional<py::object> type_;
 };
 
-} // namespace rpc
-} // namespace distributed
-} // namespace torch
+} // namespace torch::distributed::rpc

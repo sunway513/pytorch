@@ -1,114 +1,62 @@
 #pragma once
 #include <c10/core/ScalarType.h>
-#include <torch/csrc/WindowsTorchApiMacro.h>
-#include <vector>
+#include <torch/csrc/Export.h>
+#include <torch/csrc/jit/tensorexpr/fwd_decls.h>
 
-namespace torch {
-namespace jit {
-namespace tensorexpr {
-
-class Add;
-class Sub;
-class Mul;
-class Div;
-class Mod;
-class Max;
-class Min;
-class And;
-class Or;
-class Xor;
-class Lshift;
-class Rshift;
-class CompareSelect;
-
-#define IMM_DECLARE(Type, Name) class Name##Imm;
-AT_FORALL_SCALAR_TYPES_AND2(Bool, Half, IMM_DECLARE);
-#undef IMM_DECLARE
-
-class Cast;
-class Var;
-class Buf;
-class Ramp;
-class Load;
-class For;
-class Block;
-class Store;
-class Broadcast;
-class IfThenElse;
-class ExprHandle;
-class Expr;
-class BaseCallNode;
-class Intrinsics;
-class FunctionCall;
-class Allocate;
-class Free;
-class Cond;
-class Stmt;
-class Term;
-class Polynomial;
-class RoundOff;
-class ReduceOp;
-class AtomicAdd;
+namespace torch::jit::tensorexpr {
 
 class TORCH_API IRMutator {
  public:
-  virtual ~IRMutator() {}
-  virtual const Expr* mutate(const Add* v);
-  virtual const Expr* mutate(const Sub* v);
-  virtual const Expr* mutate(const Mul* v);
-  virtual const Expr* mutate(const Div* v);
-  virtual const Expr* mutate(const Mod* v);
-  virtual const Expr* mutate(const Max* v);
-  virtual const Expr* mutate(const Min* v);
-  virtual const Expr* mutate(const And* v);
-  virtual const Expr* mutate(const Or* v);
-  virtual const Expr* mutate(const Xor* v);
-  virtual const Expr* mutate(const Lshift* v);
-  virtual const Expr* mutate(const Rshift* v);
-  virtual const Expr* mutate(const CompareSelect* v);
+  virtual ~IRMutator() = default;
+  virtual ExprPtr mutate(const AddPtr& v);
+  virtual ExprPtr mutate(const SubPtr& v);
+  virtual ExprPtr mutate(const MulPtr& v);
+  virtual ExprPtr mutate(const DivPtr& v);
+  virtual ExprPtr mutate(const ModPtr& v);
+  virtual ExprPtr mutate(const MaxPtr& v);
+  virtual ExprPtr mutate(const MinPtr& v);
+  virtual ExprPtr mutate(const AndPtr& v);
+  virtual ExprPtr mutate(const OrPtr& v);
+  virtual ExprPtr mutate(const XorPtr& v);
+  virtual ExprPtr mutate(const LshiftPtr& v);
+  virtual ExprPtr mutate(const RshiftPtr& v);
+  virtual ExprPtr mutate(const CompareSelectPtr& v);
 #define IMM_MUTATE_DECLARE(Type, Name) \
-  virtual const Expr* mutate(const Name##Imm* v);
-  AT_FORALL_SCALAR_TYPES_AND2(Bool, Half, IMM_MUTATE_DECLARE);
+  virtual ExprPtr mutate(const Name##ImmPtr& v);
+  AT_FORALL_SCALAR_TYPES_AND3(Bool, Half, BFloat16, IMM_MUTATE_DECLARE)
 #undef IMM_MUTATE_DECLARE
-  virtual const Expr* mutate(const Cast* v);
-  virtual const Expr* mutate(const Var* v);
-  virtual const Expr* mutate(const Buf* v);
-  virtual const Expr* mutate(const Ramp* v);
-  virtual const Expr* mutate(const Load* v);
-  virtual const Expr* mutate(const Broadcast* v);
-  virtual const Expr* mutate(const IfThenElse* v);
+  virtual ExprPtr mutate(const CastPtr& v);
+  virtual ExprPtr mutate(const BitCastPtr& v);
+  virtual ExprPtr mutate(const VarPtr& v);
+  virtual ExprPtr mutate(const BufPtr& v);
+  virtual ExprPtr mutate(const RampPtr& v);
+  virtual ExprPtr mutate(const LoadPtr& v);
+  virtual ExprPtr mutate(const BroadcastPtr& v);
+  virtual ExprPtr mutate(const IfThenElsePtr& v);
+  virtual ExprPtr mutate(const IntrinsicsPtr& v);
 
-  // BaseCallNode is the base class for all call nodes.
-  // For any visitors that only needs the common behavior, only override this
-  // function is enough. This is because all derived class handlers will call
-  // this function by default.
-  // Override the derived class handler only if the logic is more specific to
-  // that.
-  virtual const Expr* mutate(const BaseCallNode* v);
-  virtual const Expr* mutate(const Intrinsics* v);
-  virtual const Expr* mutate(const FunctionCall* v);
+  virtual ExprPtr mutate(const TermPtr& v);
+  virtual ExprPtr mutate(const PolynomialPtr& v);
+  virtual ExprPtr mutate(const RoundOffPtr& v);
+  virtual ExprPtr mutate(const MaxTermPtr& v);
+  virtual ExprPtr mutate(const MinTermPtr& v);
 
-  virtual const Expr* mutate(const Term* v);
-  virtual const Expr* mutate(const Polynomial* v);
-  virtual const Expr* mutate(const RoundOff* v);
+  virtual ExprPtr mutate(const ReduceOpPtr& v);
 
-  virtual const Expr* mutate(const ReduceOp* v);
+  virtual StmtPtr mutate(const ForPtr& v);
+  virtual StmtPtr mutate(const BlockPtr& v);
+  virtual StmtPtr mutate(const StorePtr& v);
+  virtual StmtPtr mutate(const AtomicAddPtr& v);
+  virtual StmtPtr mutate(const SyncThreadsPtr& v);
+  virtual StmtPtr mutate(const ExternalCallPtr& v);
+  virtual StmtPtr mutate(const ExternalCallWithAllocPtr& v);
 
-  virtual Stmt* mutate(const For* v);
-  virtual Stmt* mutate(const Block* v);
-  virtual Stmt* mutate(const Store* v);
-  virtual Stmt* mutate(const AtomicAdd* v);
-
-  virtual Stmt* mutate(const Allocate* v);
-  virtual Stmt* mutate(const Free* v);
-  virtual Stmt* mutate(const Cond* v);
-
- protected:
-  const Expr* DefaultMutator(
-      const BaseCallNode* v,
-      std::vector<const Expr*>& params);
+  virtual StmtPtr mutate(const AllocatePtr& v);
+  virtual StmtPtr mutate(const FreePtr& v);
+  virtual StmtPtr mutate(const FreeExtPtr& v);
+  virtual StmtPtr mutate(const PlacementAllocatePtr& v);
+  virtual StmtPtr mutate(const LetPtr& v);
+  virtual StmtPtr mutate(const CondPtr& v);
 };
 
-} // namespace tensorexpr
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit::tensorexpr

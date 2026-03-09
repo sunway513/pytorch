@@ -1,14 +1,20 @@
 #!/usr/bin/python3
+# mypy: allow-untyped-defs
 
 import itertools
 
 import torch
-from torch.autograd.profiler import profile
+
+# pyrefly: ignore [deprecated]
+from torch.autograd.profiler_legacy import profile
 
 from . import (
     _disable_server_process_global_profiler,
     _enable_server_process_global_profiler,
 )
+
+
+__all__: list[str] = []
 
 
 class _server_process_global_profile(profile):
@@ -22,7 +28,7 @@ class _server_process_global_profile(profile):
     only report runtime of PyTorch functions.
     Note: profiler is thread local and is automatically propagated into the async tasks
 
-    Arguments:
+    Args:
         enabled (bool, optional): Setting this to False makes this context manager a no-op.
             Default: ``True``.
 
@@ -43,29 +49,34 @@ class _server_process_global_profile(profile):
 
         profile_memory (bool, optional): Whether to report memory usage, default: ``False``
 
-    .. warning:
+    .. warning::
         Enabling memory profiling incurs additional profiler overhead
 
-    .. warning:
-        Due to some CUDA multiprocessing limitations (multiprocessing-cuda-note_),
+    .. warning::
+        Due to some CUDA multiprocessing limitations (see :ref:`multiprocessing-cuda-note`),
         one cannot use the profiler with ``use_cuda = True`` to benchmark
         DataLoaders with ``num_workers > 0``. If you wish to benchmark data loading,
         please use ``use_cuda = False`` or ``num_workers = 0``.
 
     Example:
+        >>> # xdoctest: +SKIP
         >>> # On worker 0:
         >>> import torch
         >>> import torch.distributed.rpc as rpc
         >>> rpc.init_rpc("worker0", rank=0, world_size=2)
         >>> x, y = torch.tensor(1), torch.tensor(2)
-        >>> outer_profile_rref = rpc.remote(dst_worker_name, rpc._server_process_global_profile)
+        >>> outer_profile_rref = rpc.remote(
+        ...     dst_worker_name, rpc._server_process_global_profile
+        ... )
         >>> outer_profile_rref.rpc_sync().__enter__()
         >>> rpc.rpc_sync(dst_worker_name, torch.add, (x, y))
-        >>> inner_profile_rref = rpc.remote(dst_worker_name, rpc._server_process_global_profile)
+        >>> inner_profile_rref = rpc.remote(
+        ...     dst_worker_name, rpc._server_process_global_profile
+        ... )
         >>> inner_profile_rref.rpc_sync().__enter__()
         >>> rpc.rpc_sync(dst_worker_name, torch.sub, (x, y))
         >>> inner_profile_rref.rpc_sync().__exit__(None, None, None)
-        >>> outer_profile_rref.rpc_sync().__exit__(None, None, None
+        >>> outer_profile_rref.rpc_sync().__exit__(None, None, None)
         >>> print(inner_profile_rref.rpc_sync().key_averages())
         ---------  ---------------  ---------------  ---------------  ---------------  ---------------  ---------------
         Name       Self CPU total %  Self CPU total   CPU total %      CPU total        CPU time avg     Number of Calls
@@ -103,7 +114,7 @@ class _server_process_global_profile(profile):
         if not self.enabled:
             return
 
-        if self.entered:
+        if self.entered:  # type: ignore[has-type]
             raise RuntimeError("autograd profiler traces are not reentrant")
         self.entered = True
 
@@ -113,7 +124,13 @@ class _server_process_global_profile(profile):
             else torch.autograd.ProfilerState.CPU
         )
         profiler_config = torch.autograd.ProfilerConfig(
-            profiler_kind, self.record_shapes, self.profile_memory
+            profiler_kind,
+            self.record_shapes,
+            self.profile_memory,
+            False,
+            False,
+            False,
+            torch.profiler._ExperimentalConfig(),
         )
         _enable_server_process_global_profiler(profiler_config)
         return self
@@ -121,9 +138,9 @@ class _server_process_global_profile(profile):
     def __exit__(self, exc_type, exc_val, exc_tb):
         """
         Turn off server-side process-global profiling.
-        Aggregrate all profiling events recorded by RPC threads.
+        Aggregate all profiling events recorded by RPC threads.
 
-        These attribuets are assigned on exiting context.
+        These attributes are assigned on exiting context.
 
         Attributes:
             function_events (torch.autograd.profiler.EventList).  It's a list that has helper
@@ -143,25 +160,28 @@ class _server_process_global_profile(profile):
         process_global_function_events = []
         for thread_local_events in process_global_events:
             # Parse from ``Event``s to ``FunctionEvent``s.
-            thread_local_function_events = torch.autograd.profiler.parse_cpu_trace(
-                thread_local_events
+            thread_local_function_events = (
+                torch.autograd.profiler_legacy._parse_legacy_records(
+                    thread_local_events
+                )
             )
             thread_local_function_events.sort(
                 key=lambda function_event: [
-                    function_event.cpu_interval.start,
-                    -(function_event.cpu_interval.end),
+                    function_event.time_range.start,
+                    -(function_event.time_range.end),
                 ]
             )
             process_global_function_events.append(thread_local_function_events)
 
         flattened_function_events = list(
-            itertools.chain(*process_global_function_events)
+            itertools.chain.from_iterable(process_global_function_events)
         )
-        self.function_events = torch.autograd.profiler.EventList(
+        self.function_events = torch.autograd.profiler_util.EventList(
             flattened_function_events,
-            use_cuda=self.use_cuda,
+            use_device="cuda" if self.use_cuda else None,
             profile_memory=self.profile_memory,
         )
+        self.function_events._build_tree()
 
         self.process_global_function_events = process_global_function_events
 

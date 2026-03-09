@@ -1,10 +1,7 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-from __future__ import unicode_literals
-
+from pt import configs
 
 import operator_benchmark as op_bench
+
 import torch
 import torch.nn as nn
 
@@ -14,163 +11,278 @@ Microbenchmarks for Conv1d and ConvTranspose1d operators.
 """
 
 
-# Configs for conv-1d ops
-conv_1d_configs_short = op_bench.config_list(
-    attr_names=[
-        'IC', 'OC', 'kernel', 'stride', 'N', 'L'
-    ],
-    attrs=[
-        [128, 256, 3, 1, 1, 64],
-        [256, 256, 3, 2, 4, 64],
-    ],
-    cross_product_configs={
-        'device': ['cpu', 'cuda'],
-    },
-    tags=['short']
-)
-
-conv_1d_configs_long = op_bench.cross_product_configs(
-    IC=[128, 512],
-    OC=[128, 512],
-    kernel=[3],
-    stride=[1, 2],
-    N=[8],
-    L=[128],
-    device=['cpu', 'cuda'],
-    tags=["long"]
-)
-
-
 class Conv1dBenchmark(op_bench.TorchBenchmarkBase):
     def init(self, IC, OC, kernel, stride, N, L, device):
-        self.input = torch.rand(N, IC, L, device=device)
+        self.inputs = {
+            "input": torch.rand(N, IC, L, device=device, requires_grad=self.auto_set())
+        }
         self.conv1d = nn.Conv1d(IC, OC, kernel, stride=stride).to(device=device)
-        self.set_module_name('Conv1d')
+        self.set_module_name("Conv1d")
 
-    def forward(self):
-        return self.conv1d(self.input)
+    def forward(self, input):
+        return self.conv1d(input)
+
+    def get_memory_traffic_bytes(self):
+        """Calculate memory traffic for Conv1d: read(input + weight) + write(output)"""
+        input_tensor = self.inputs["input"]
+        # Run forward to get output shape
+        with torch.no_grad():
+            output = self.conv1d(input_tensor)
+
+        bytes_per_element = input_tensor.element_size()
+        # Input: N × IC × L
+        input_elements = input_tensor.numel()
+        # Weight: OC × IC × kernel
+        weight_elements = self.conv1d.weight.numel()
+        # Output: N × OC × L_out
+        output_elements = output.numel()
+
+        total_elements = input_elements + weight_elements + output_elements
+        return total_elements * bytes_per_element
 
 
 class ConvTranspose1dBenchmark(op_bench.TorchBenchmarkBase):
     def init(self, IC, OC, kernel, stride, N, L, device):
-        self.input = torch.rand(N, IC, L, device=device)
-        self.convtranspose1d = nn.ConvTranspose1d(IC, OC, kernel, stride=stride).to(device=device)
-        self.set_module_name('ConvTranspose1d')
+        self.inputs = {"input": torch.rand(N, IC, L, device=device)}
+        self.convtranspose1d = nn.ConvTranspose1d(IC, OC, kernel, stride=stride).to(
+            device=device
+        )
+        self.set_module_name("ConvTranspose1d")
 
-    def forward(self):
-        return self.convtranspose1d(self.input)
+    def forward(self, input):
+        return self.convtranspose1d(input)
+
+    def get_memory_traffic_bytes(self):
+        """Calculate memory traffic for ConvTranspose1d: read(input + weight) + write(output)"""
+        input_tensor = self.inputs["input"]
+        # Run forward to get output shape
+        with torch.no_grad():
+            output = self.convtranspose1d(input_tensor)
+
+        bytes_per_element = input_tensor.element_size()
+        # Input: N × IC × L
+        input_elements = input_tensor.numel()
+        # Weight: IC × OC × kernel
+        weight_elements = self.convtranspose1d.weight.numel()
+        # Output: N × OC × L_out
+        output_elements = output.numel()
+
+        total_elements = input_elements + weight_elements + output_elements
+        return total_elements * bytes_per_element
 
 
-op_bench.generate_pt_test(conv_1d_configs_short + conv_1d_configs_long,
-                          Conv1dBenchmark)
-op_bench.generate_pt_test(conv_1d_configs_short + conv_1d_configs_long,
-                          ConvTranspose1dBenchmark)
+op_bench.generate_pt_test(
+    configs.conv_1d_configs_short + configs.conv_1d_configs_long, Conv1dBenchmark
+)
+op_bench.generate_pt_gradient_test(
+    configs.remove_cpu(configs.conv_1d_configs_short + configs.conv_1d_configs_long),
+    Conv1dBenchmark,
+)
+
+op_bench.generate_pt_test(
+    configs.convtranspose_1d_configs_short
+    + configs.conv_1d_configs_short
+    + configs.conv_1d_configs_long,
+    ConvTranspose1dBenchmark,
+)
 
 
 """
-Microbenchmarks for Conv2d and ConvTranspose2d operators.
+Microbenchmarks for Conv2d, ConvTranspose2d, and Conv2dPointwise operators.
 """
-
-
-# Configs for Conv2d and ConvTranspose1d
-conv_2d_configs_short = op_bench.config_list(
-    attr_names=[
-        'IC', 'OC', 'kernel', 'stride', 'N', 'H', 'W', 'G', 'pad',
-    ],
-    attrs=[
-        [256, 256, 3, 1, 1, 16, 16, 1, 0],
-    ],
-    cross_product_configs={
-        'device': ['cpu', 'cuda'],
-    },
-    tags=['short']
-)
-
-conv_2d_configs_long = op_bench.cross_product_configs(
-    IC=[128, 256],
-    OC=[128, 256],
-    kernel=[3],
-    stride=[1, 2],
-    N=[4],
-    H=[32],
-    W=[32],
-    G=[1],
-    pad=[0],
-    device=['cpu', 'cuda'],
-    tags=["long"]
-)
 
 
 class Conv2dBenchmark(op_bench.TorchBenchmarkBase):
     def init(self, IC, OC, kernel, stride, N, H, W, G, pad, device):
-        self.input = torch.rand(N, IC, H, W, device=device)
+        self.inputs = {"input": torch.rand(N, IC, H, W, device=device)}
         self.conv2d = nn.Conv2d(
-            IC, OC, kernel, stride=stride, groups=G, padding=pad).to(device=device)
-        self.set_module_name('Conv2d')
+            IC, OC, kernel, stride=stride, groups=G, padding=pad
+        ).to(device=device)
+        self.set_module_name("Conv2d")
 
-    def forward(self):
-        return self.conv2d(self.input)
+    def forward(self, input):
+        return self.conv2d(input)
+
+    def get_memory_traffic_bytes(self):
+        """Calculate memory traffic for Conv2d: read(input + weight) + write(output)"""
+        input_tensor = self.inputs["input"]
+        # Run forward to get output shape
+        with torch.no_grad():
+            output = self.conv2d(input_tensor)
+
+        bytes_per_element = input_tensor.element_size()
+        # Input: N × IC × H × W
+        input_elements = input_tensor.numel()
+        # Weight: OC × (IC/G) × kernel × kernel
+        weight_elements = self.conv2d.weight.numel()
+        # Output: N × OC × H_out × W_out
+        output_elements = output.numel()
+
+        total_elements = input_elements + weight_elements + output_elements
+        return total_elements * bytes_per_element
 
 
 class ConvTranspose2dBenchmark(op_bench.TorchBenchmarkBase):
     def init(self, IC, OC, kernel, stride, N, H, W, G, pad, device):
-        self.input = torch.rand(N, IC, H, W, device=device)
+        self.inputs = {"input": torch.rand(N, IC, H, W, device=device)}
         self.convtranspose2d = nn.ConvTranspose2d(
-            IC, OC, kernel, stride=stride, groups=G, padding=pad).to(device=device)
-        self.set_module_name('ConvTranspose2d')
+            IC, OC, kernel, stride=stride, groups=G, padding=pad
+        ).to(device=device)
+        self.set_module_name("ConvTranspose2d")
 
-    def forward(self):
-        return self.convtranspose2d(self.input)
+    def forward(self, input):
+        return self.convtranspose2d(input)
+
+    def get_memory_traffic_bytes(self):
+        """Calculate memory traffic for ConvTranspose2d: read(input + weight) + write(output)"""
+        input_tensor = self.inputs["input"]
+        # Run forward to get output shape
+        with torch.no_grad():
+            output = self.convtranspose2d(input_tensor)
+
+        bytes_per_element = input_tensor.element_size()
+        # Input: N × IC × H × W
+        input_elements = input_tensor.numel()
+        # Weight: IC × (OC/G) × kernel × kernel
+        weight_elements = self.convtranspose2d.weight.numel()
+        # Output: N × OC × H_out × W_out
+        output_elements = output.numel()
+
+        total_elements = input_elements + weight_elements + output_elements
+        return total_elements * bytes_per_element
 
 
-op_bench.generate_pt_test(conv_2d_configs_short + conv_2d_configs_long,
-                          Conv2dBenchmark)
-op_bench.generate_pt_test(conv_2d_configs_short + conv_2d_configs_long,
-                          ConvTranspose2dBenchmark)
+class Conv2dPointwiseBenchmark(op_bench.TorchBenchmarkBase):
+    def init(self, IC, OC, stride, N, H, W, G, pad, device):
+        self.inputs = {"input": torch.rand(N, IC, H, W, device=device)}
+        # Use 1 as kernel for pointwise convolution
+        self.conv2d = nn.Conv2d(IC, OC, 1, stride=stride, groups=G, padding=pad).to(
+            device=device
+        )
+        self.set_module_name("Conv2dPointwise")
+
+    def forward(self, input):
+        return self.conv2d(input)
+
+    def get_memory_traffic_bytes(self):
+        """Calculate memory traffic for Conv2dPointwise: read(input + weight) + write(output)"""
+        input_tensor = self.inputs["input"]
+        # Run forward to get output shape
+        with torch.no_grad():
+            output = self.conv2d(input_tensor)
+
+        bytes_per_element = input_tensor.element_size()
+        # Input: N × IC × H × W
+        input_elements = input_tensor.numel()
+        # Weight: OC × (IC/G) × 1 × 1
+        weight_elements = self.conv2d.weight.numel()
+        # Output: N × OC × H_out × W_out
+        output_elements = output.numel()
+
+        total_elements = input_elements + weight_elements + output_elements
+        return total_elements * bytes_per_element
+
+
+op_bench.generate_pt_test(
+    configs.conv_2d_configs_short + configs.conv_2d_configs_long, Conv2dBenchmark
+)
+op_bench.generate_pt_test(
+    configs.conv_2d_configs_short + configs.conv_2d_configs_long,
+    ConvTranspose2dBenchmark,
+)
+op_bench.generate_pt_test(
+    configs.conv_2d_pw_configs_short + configs.conv_2d_pw_configs_long,
+    Conv2dPointwiseBenchmark,
+)
+op_bench.generate_pt_gradient_test(
+    configs.remove_cpu(configs.conv_2d_configs_short + configs.conv_2d_configs_long),
+    Conv2dBenchmark,
+)
+op_bench.generate_pt_gradient_test(
+    configs.remove_cpu(configs.conv_2d_configs_short + configs.conv_2d_configs_long),
+    ConvTranspose2dBenchmark,
+)
+op_bench.generate_pt_gradient_test(
+    configs.remove_cpu(
+        configs.conv_2d_pw_configs_short + configs.conv_2d_pw_configs_long
+    ),
+    Conv2dPointwiseBenchmark,
+)
 
 
 """
 Microbenchmarks for Conv3d and ConvTranspose3d operators.
 """
 
-# Configs for Conv3d and ConvTranspose3d
-conv_3d_configs_short = op_bench.config_list(
-    attr_names=[
-        'IC', 'OC', 'kernel', 'stride', 'N', 'D', 'H', 'W'
-    ],
-    attrs=[
-        [64, 64, 3, 1, 8, 4, 16, 16],
-    ],
-    cross_product_configs={
-        'device': ['cpu', 'cuda'],
-    },
-    tags=['short']
-)
-
 
 class Conv3dBenchmark(op_bench.TorchBenchmarkBase):
-    def init(self, IC, OC, kernel, stride, N, D, H, W, device):
-        self.input = torch.rand(N, IC, D, H, W, device=device)
-        self.conv3d = nn.Conv3d(IC, OC, kernel, stride=stride).to(device=device)
-        self.set_module_name('Conv3d')
+    def init(self, IC, OC, kernel, stride, N, D, H, W, device, dtype=torch.float32):
+        self.inputs = {"input": torch.rand(N, IC, D, H, W, device=device, dtype=dtype)}
+        self.conv3d = nn.Conv3d(IC, OC, kernel, stride=stride).to(
+            device=device, dtype=dtype
+        )
+        self.set_module_name("Conv3d")
 
-    def forward(self):
-        return self.conv3d(self.input)
+    def forward(self, input):
+        return self.conv3d(input)
+
+    def get_memory_traffic_bytes(self):
+        """Calculate memory traffic for Conv3d: read(input + weight) + write(output)"""
+        input_tensor = self.inputs["input"]
+        # Run forward to get output shape
+        with torch.no_grad():
+            output = self.conv3d(input_tensor)
+
+        bytes_per_element = input_tensor.element_size()
+        # Input: N × IC × D × H × W
+        input_elements = input_tensor.numel()
+        # Weight: OC × IC × kernel × kernel × kernel
+        weight_elements = self.conv3d.weight.numel()
+        # Output: N × OC × D_out × H_out × W_out
+        output_elements = output.numel()
+
+        total_elements = input_elements + weight_elements + output_elements
+        return total_elements * bytes_per_element
 
 
 class ConvTranspose3dBenchmark(op_bench.TorchBenchmarkBase):
-    def init(self, IC, OC, kernel, stride, N, D, H, W, device):
-        self.input = torch.rand(N, IC, D, H, W, device=device)
-        self.convtranspose3d = nn.ConvTranspose3d(IC, OC, kernel, stride=stride).to(device=device)
-        self.set_module_name('ConvTranspose3d')
+    def init(self, IC, OC, kernel, stride, N, D, H, W, device, dtype=torch.float32):
+        self.inputs = {"input": torch.rand(N, IC, D, H, W, device=device, dtype=dtype)}
+        self.convtranspose3d = nn.ConvTranspose3d(IC, OC, kernel, stride=stride).to(
+            device=device, dtype=dtype
+        )
+        self.set_module_name("ConvTranspose3d")
 
-    def forward(self):
-        return self.convtranspose3d(self.input)
+    def forward(self, input):
+        return self.convtranspose3d(input)
+
+    def get_memory_traffic_bytes(self):
+        """Calculate memory traffic for ConvTranspose3d: read(input + weight) + write(output)"""
+        input_tensor = self.inputs["input"]
+        # Run forward to get output shape
+        with torch.no_grad():
+            output = self.convtranspose3d(input_tensor)
+
+        bytes_per_element = input_tensor.element_size()
+        # Input: N × IC × D × H × W
+        input_elements = input_tensor.numel()
+        # Weight: IC × OC × kernel × kernel × kernel
+        weight_elements = self.convtranspose3d.weight.numel()
+        # Output: N × OC × D_out × H_out × W_out
+        output_elements = output.numel()
+
+        total_elements = input_elements + weight_elements + output_elements
+        return total_elements * bytes_per_element
 
 
-op_bench.generate_pt_test(conv_3d_configs_short, Conv3dBenchmark)
-op_bench.generate_pt_test(conv_3d_configs_short,
-                          ConvTranspose3dBenchmark)
+op_bench.generate_pt_test(configs.conv_3d_configs_short, Conv3dBenchmark)
+op_bench.generate_pt_test(configs.conv_3d_configs_short, ConvTranspose3dBenchmark)
+op_bench.generate_pt_gradient_test(
+    configs.remove_cpu(configs.conv_3d_configs_long), Conv3dBenchmark
+)
+op_bench.generate_pt_gradient_test(
+    configs.remove_cpu(configs.conv_3d_configs_long), ConvTranspose3dBenchmark
+)
 
 
 if __name__ == "__main__":

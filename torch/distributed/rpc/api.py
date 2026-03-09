@@ -1,19 +1,18 @@
+# mypy: allow-untyped-decorators
+# mypy: allow-untyped-defs
+
 import collections
 import contextlib
 import functools
+import inspect
 import logging
-import numbers
 import threading
+from typing import Any, Generic, TYPE_CHECKING, TypeVar
 
 import torch
-import torch.distributed as dist
-from torch.jit import Future  # noqa F401
-
-from . import (
-    RpcBackendOptions,
-    WorkerInfo,
+from torch._C._distributed_rpc import (
     _cleanup_python_rpc_handler,
-    _delete_all_user_rrefs,
+    _delete_all_user_and_unforked_owner_rrefs,
     _destroy_rref_context,
     _get_current_rpc_agent,
     _invoke_remote_builtin,
@@ -25,21 +24,37 @@ from . import (
     _is_current_rpc_agent_set,
     _reset_current_rpc_agent,
     _set_and_start_rpc_agent,
-    backend_registry,
+    get_rpc_timeout,
+    PyRRef,
+    RemoteProfilerManager,
+    WorkerInfo,
 )
+from torch.futures import Future
 
+from ._utils import _group_membership_management, _update_group_membership
+from .constants import DEFAULT_SHUTDOWN_TIMEOUT, UNSET_RPC_TIMEOUT
 from .internal import (
+    _build_rpc_profiling_key,
+    _internal_rpc_pickler,
     PythonUDF,
     RPCExecMode,
-    _internal_rpc_pickler,
-    _build_rpc_profiling_key,
 )
 
-from .constants import UNSET_RPC_TIMEOUT
+
+__all__ = [
+    "shutdown",
+    "get_worker_info",
+    "remote",
+    "rpc_sync",
+    "rpc_async",
+    "RRef",
+    "AllGatherStates",
+    "method_factory",
+    "new_method",
+]
 
 
 logger = logging.getLogger(__name__)
-
 
 # NB: Ignoring RRef leaks during shutdown. Without this, applications have to
 # make sure there is no references to any RRef in the application code and
@@ -80,59 +95,214 @@ def _require_initialized(func):
     return wrapper
 
 
-class WaitAllWorkersStates(object):
+class AllGatherStates:
     def __init__(self):
-        # Each `intent_worker_names` is an empty set at beginning.
-        # It's only used by leader worker. Leader worker is user-specified or
-        # elected as the first worker in a sorted worker name list.
-        # Whenever there is a worker showing shutdown intention to the leader, by
-        # calling `_wait_all_workers()`, the leader adds this worker's name to the set.
-        # The leader also adds itself's name to the set on calling
-        # `_wait_all_workers()`. We need this because, we confine `_wait_all_workers()`
-        # to be called only once, by examing if leader's name has been added to the set.
-        self.intent_worker_names = set()
-        # Once `intent_worker_names == _ALL_WORKER_NAMES`,
-        # we flip `_SHUTDOWN_PROCEED_SIGNAL` on the leader, and leader will send RPCs
-        # to follower workers to flip their `_SHUTDOWN_PROCEED_SIGNAL`s.
+        # Each `gathered_objects` is an empty dict at beginning.
+        # The leader worker is elected as the first worker in a sorted worker
+        # name list. Whenever there is a worker entering `_all_gather()`, it
+        # runs `_gather_to_leader()` on the leader to add its own name and
+        # data obj to this dict. The leader also adds itself's name to the dict
+        # on calling `_all_gather()`.
+        # Once `set(gathered_objects.keys()) == _ALL_WORKER_NAMES`, the leader
+        # will broadcast the gathered dict to all follower workers and set their
+        # `gathered_objects` field and the `proceed_signal` field.
+        self.gathered_objects = {}
+        # All workers wait on this signal until it receives all gathered
+        # objects.
         self.proceed_signal = threading.Event()
 
 
-# States used by `def _wait_all_workers()`.
-# `_ALL_WORKER_NAMES` is initialized on initiaizing RPC layer.
-_ALL_WORKER_NAMES = None
-_wait_all_workers_dict_lock = threading.Lock()
-_wait_all_workers_sequence_id = 0
-_wait_all_workers_sequence_id_to_states = collections.defaultdict(WaitAllWorkersStates)
+# States used by `def _all_gather()`.
+# `_ALL_WORKER_NAMES` is initialized on initializing RPC layer.
+_ALL_WORKER_NAMES: set[Any] = set()
+_all_gather_dict_lock = threading.RLock()
+_all_gather_sequence_id: dict[str, int] = {}
+_all_gather_sequence_id_to_states: collections.defaultdict = collections.defaultdict(
+    AllGatherStates
+)
 
 
-def _on_leader_follower_report_shutdown_intent(sequence_id, worker_name):
-    with _wait_all_workers_dict_lock:
-        assert (
-            worker_name in _ALL_WORKER_NAMES
-        ), "{worker_name} is not expected by leader.".format(worker_name=worker_name)
-        intent_worker_names = _wait_all_workers_sequence_id_to_states[
-            sequence_id
-        ].intent_worker_names
-        assert (
-            worker_name not in intent_worker_names
-        ), "{worker_name} reported intent sequence id {sequence_id} twice. ".format(
-            worker_name=worker_name, sequence_id=sequence_id
+def _init_rpc_states(agent):
+    worker_infos = agent.get_worker_infos()
+    global _ALL_WORKER_NAMES
+    _ALL_WORKER_NAMES = {worker_info.name for worker_info in worker_infos}
+
+    # NB: backend implementation might have already set the rpc_agent.
+    if not _is_current_rpc_agent_set():
+        _set_and_start_rpc_agent(agent)
+
+
+def _gather_to_leader(sequence_id, worker_name, obj, worker_names=None):
+    with _all_gather_dict_lock:
+        if not worker_names:
+            worker_names = _ALL_WORKER_NAMES
+            if worker_name not in worker_names:
+                raise AssertionError(f"{worker_name} is not expected by leader.")
+        states = _all_gather_sequence_id_to_states[sequence_id]
+        if worker_name in states.gathered_objects:
+            raise AssertionError(
+                f"{worker_name} reported intent sequence id {sequence_id} twice. "
+            )
+        states.gathered_objects[worker_name] = obj
+        if worker_names == set(states.gathered_objects.keys()):
+            states.proceed_signal.set()
+
+
+def _broadcast_to_followers(sequence_id, objects_map):
+    with _all_gather_dict_lock:
+        states = _all_gather_sequence_id_to_states[sequence_id]
+
+    if states.proceed_signal.is_set():
+        raise AssertionError(
+            f"Termination signal sequence id {sequence_id} got set twice."
         )
-        intent_worker_names.add(worker_name)
-        if _ALL_WORKER_NAMES == intent_worker_names:
-            _set_proceed_shutdown_signal(sequence_id)
+    states.gathered_objects = objects_map
+    states.proceed_signal.set()
 
 
-def _set_proceed_shutdown_signal(sequence_id):
-    proceed_signal = _wait_all_workers_sequence_id_to_states[sequence_id].proceed_signal
-    assert (
-        not proceed_signal.is_set()
-    ), "Termination signal sequence id {} got set twice.".format(sequence_id)
-    proceed_signal.set()
+_thread_local_var = threading.local()
+
+
+@contextlib.contextmanager
+def _wait_all():
+    r"""
+    A context manager that collects all futures returned by ``rpc_async`` and
+    waits them on the context manager's exit; relieving the user of needing
+    to explicitly call wait.
+
+
+    Example::
+        >>> # xdoctest: +SKIP("distributed")
+        >>> # On worker 0:
+        >>> import torch
+        >>> import torch.distributed.rpc as rpc
+        >>> rpc.init_rpc("worker0", rank=0, world_size=2)
+        >>> with rpc._wait_all():
+        >>>    fut_1 = rpc.rpc_async(dst, torch.add, (torch.ones(2, 2), 1))
+        >>>    fut_2 = rpc.rpc_async(dst, torch.add, (torch.ones(2, 2), 1))
+        >>> #fut_1 and fut_2 are waited on
+    """
+    _thread_local_var.future_list = []
+    try:
+        yield
+    finally:
+        try:
+            torch.futures.wait_all(_thread_local_var.future_list)
+        finally:
+            del _thread_local_var.future_list
 
 
 @_require_initialized
-def _wait_all_workers():
+def _all_gather(obj, worker_names=None, timeout: float = UNSET_RPC_TIMEOUT):
+    r"""
+    This is similar to torch.distributed.all_gather(), but is using RPC. It
+    picks the worker with the smallest name (alphabetic order) as the leader.
+    Then all followers send their data ``obj`` to the leader. After the leader
+    has received all, it will broadcast the results back to all followers. This
+    function blocks until all workers have received the gathered results.
+    """
+    if not worker_names:
+        if _ALL_WORKER_NAMES is None:
+            raise AssertionError(
+                "`_ALL_WORKER_NAMES` is not initialized for `def _all_gather`."
+            )
+        worker_names = _ALL_WORKER_NAMES
+    leader_name = min(worker_names)
+
+    self_name = _get_current_rpc_agent().get_worker_info().name
+
+    with _all_gather_dict_lock:
+        concat_names = "".join(sorted(worker_names))
+        sequence_num = _all_gather_sequence_id.get(concat_names, 0)
+        _all_gather_sequence_id[concat_names] = sequence_num + 1
+        sequence_id = concat_names + str(sequence_num)
+
+    is_leader = leader_name == self_name
+
+    if timeout == UNSET_RPC_TIMEOUT:
+        # Timeout is specified by agent for RPC calls
+        rpc_timeout = get_rpc_timeout()
+        # No timeout for signal
+        signal_timeout = None
+    elif timeout == DEFAULT_SHUTDOWN_TIMEOUT:
+        # No timeout for RPC
+        rpc_timeout = timeout
+        # No timeout for signal
+        signal_timeout = None
+    else:
+        # Signal and RPC timeout use the same timeout
+        signal_timeout = rpc_timeout = timeout
+
+    # Phase 1: Followers send it's object to the leader
+    if is_leader:
+        _gather_to_leader(sequence_id, self_name, obj, worker_names)
+    else:
+        rpc_sync(
+            leader_name,
+            _gather_to_leader,
+            args=(sequence_id, self_name, obj, worker_names),
+            timeout=rpc_timeout,
+        )
+
+    with _all_gather_dict_lock:
+        states = _all_gather_sequence_id_to_states[sequence_id]
+
+    # Timeout is either set by function parameter or None (which is indefinite)
+    states.proceed_signal.wait(timeout=signal_timeout)
+
+    # Phase 2: Leader broadcast gathered results to all followers
+    # Leader's signal is the first to be unblocked, after receiving all
+    # followers' data objects.
+    if is_leader:
+        worker_name_to_response_future_dict = {}
+        for follower_name in worker_names - {leader_name}:
+            fut = rpc_async(
+                follower_name,
+                _broadcast_to_followers,
+                args=(sequence_id, states.gathered_objects),
+                timeout=rpc_timeout,
+            )
+            worker_name_to_response_future_dict[follower_name] = fut
+
+        errors = []
+        for follower_name, fut in worker_name_to_response_future_dict.items():
+            try:
+                fut.wait()
+            except RuntimeError as ex:
+                errors.append((follower_name, ex))
+
+        if errors:
+            raise RuntimeError(
+                f"Followers {[e[0] for e in errors]} timed out in _all_gather "
+                f"after {rpc_timeout:.2f} seconds. The first exception is {errors[0][1]}"
+            )
+
+    # Clean up for the states using the sequence_id
+    with _all_gather_dict_lock:
+        states = _all_gather_sequence_id_to_states.pop(sequence_id)
+    return states.gathered_objects
+
+
+@_require_initialized
+def _barrier(worker_names):
+    r"""
+    Synchronizes local and remote RPC processes.
+
+    This will block until all local and remote RPC processes specified under worker_names
+    reach this method to wait for all outstanding work to complete.
+
+    Args:
+        worker_names (List[str]): The set of workers to synchronize.
+
+    """
+    try:
+        _all_gather(None, set(worker_names))
+    except RuntimeError:
+        logger.exception("Failed to complete barrier")
+
+
+@_require_initialized
+def _wait_all_workers(timeout=DEFAULT_SHUTDOWN_TIMEOUT):
     r"""
     Block until all local and remote RPC processes reach this method and wait
     for all outstanding work to complete. Every RPC process must call this
@@ -140,62 +310,15 @@ def _wait_all_workers():
     terminate the RPC framework, and there is no guarantee that the RPC
     framework will work after this method returns.
     """
-    assert (
-        _ALL_WORKER_NAMES is not None
-    ), "`_ALL_WORKER_NAMES` is not initialized for `def _wait_all_workers`."
-    leader_worker_name = sorted(_ALL_WORKER_NAMES)[0]
-
-    self_worker_name = _get_current_rpc_agent().get_worker_info().name
-
-    global _wait_all_workers_sequence_id
-    with _wait_all_workers_dict_lock:
-        sequence_id = _wait_all_workers_sequence_id
-        _wait_all_workers_sequence_id += 1
-
-    is_leader_worker = leader_worker_name == self_worker_name
-    # Set a long enough timeout for all shutdown messages to be processed.
-    timeout = 5  # seconds
-
-    # Phase 1: Followers send intents.
-    # All followers report intents to the leader.
-    if is_leader_worker:
-        _on_leader_follower_report_shutdown_intent(sequence_id, self_worker_name)
-    else:
-        rpc_sync(
-            leader_worker_name,
-            _on_leader_follower_report_shutdown_intent,
-            args=(sequence_id, self_worker_name,),
-            timeout=timeout,
-        )
-
-    proceed_signal = _wait_all_workers_sequence_id_to_states[
-        sequence_id
-    ].proceed_signal
-    proceed_signal.wait()
-
-    # Phase 2: Leader asks followers to proceed.
-    # Leader's signal is the first to be unblocked,
-    # after receiving all followers' intents.
-    if is_leader_worker:
-        # The leader sends out proceeed signals to all followers.
-        worker_name_to_response_future_dict = dict()
-        for follower_worker_name in _ALL_WORKER_NAMES - {leader_worker_name}:
-            fut = rpc_async(follower_worker_name, _set_proceed_shutdown_signal,
-                            args=(sequence_id,), timeout=timeout)
-            worker_name_to_response_future_dict[follower_worker_name] = fut
-        for follower_worker_name, fut in worker_name_to_response_future_dict.items():
-            try:
-                fut.wait()
-            except RuntimeError as ex:
-                logger.error(
-                    "{worker_name} failed to respond to 'Shutdown Proceed.' request in {timeout}".format(
-                        worker_name=follower_worker_name, timeout=timeout
-                    )
-                )
+    try:
+        _all_gather(None, timeout=timeout)
+    except RuntimeError as ex:
+        logger.exception("Failed to respond to 'Shutdown Proceed' in time")
+        raise ex
 
 
 @_require_initialized
-def shutdown(graceful=True):
+def shutdown(graceful=True, timeout=DEFAULT_SHUTDOWN_TIMEOUT):
     r"""
     Perform a shutdown of the RPC agent, and then destroy the RPC agent. This
     stops the local agent from accepting outstanding requests, and shuts
@@ -206,9 +329,11 @@ def shutdown(graceful=True):
     RPC processes to reach this method.
 
     .. warning::
-        Warning, ``future.wait()`` should not be called after ``shutdown()``.
+        For :class:`~torch.futures.Future` objects returned by
+        :meth:`~torch.distributed.rpc.rpc_async`, ``future.wait()`` should not
+        be called after ``shutdown()``.
 
-    Arguments:
+    Args:
         graceful (bool): Whether to do a graceful shutdown or not. If True,
                          this will 1) wait until there is no pending system
                          messages for ``UserRRefs`` and delete them; 2) block
@@ -217,15 +342,16 @@ def shutdown(graceful=True):
                          complete.
 
     Example::
-        Make sure that ``MASTER_ADDRESS`` and ``MASTER_PORT`` are set properly
+        Make sure that ``MASTER_ADDR`` and ``MASTER_PORT`` are set properly
         on both workers. Refer to :meth:`~torch.distributed.init_process_group`
         API for more details. For example,
 
-        >>> export MASTER_ADDRESS=localhost
-        >>> export MASTER_port=5678
+        export MASTER_ADDR=localhost
+        export MASTER_PORT=5678
 
         Then run the following code in two different processes:
 
+        >>> # xdoctest: +SKIP
         >>> # On worker 0:
         >>> import torch
         >>> import torch.distributed.rpc as rpc
@@ -242,9 +368,36 @@ def shutdown(graceful=True):
         >>> rpc.shutdown()
     """
     if graceful:
-        _wait_all_workers()
-        _delete_all_user_rrefs()
-        _get_current_rpc_agent().join()
+        try:
+            agent = _get_current_rpc_agent()
+            from torch._C._distributed_rpc import TensorPipeAgent
+
+            if not isinstance(agent, TensorPipeAgent) or agent.is_static_group:
+                _wait_all_workers(timeout)
+                _delete_all_user_and_unforked_owner_rrefs()
+                agent.join(shutdown=True, timeout=timeout)
+            else:
+                # This is a dynamic group so we need to grab the token for the operation
+                my_worker_info = agent.get_worker_info()
+                my_name = my_worker_info.name
+                with _group_membership_management(agent.store, my_name, False):
+                    all_worker_infos = agent.get_worker_infos()
+                    for worker in all_worker_infos:
+                        if worker.name != my_name:
+                            rpc_sync(
+                                worker.name,
+                                _update_group_membership,
+                                args=(my_worker_info, [], {}, False),
+                            )
+                    agent.join(shutdown=True, timeout=timeout)
+        finally:
+            # In case of errors, continue to complete the local shutdown.
+            _finalize_shutdown()
+    else:
+        _finalize_shutdown()
+
+
+def _finalize_shutdown():
     try:
         # This raises a `TORCH_CHECK()` exception on RRef leak detected.
         _destroy_rref_context(_ignore_rref_leak)
@@ -265,38 +418,6 @@ def shutdown(graceful=True):
         _reset_current_rpc_agent()
 
 
-# TODO: add a context manager to wrap _init_rpc_backend and shutdown
-def _init_rpc_backend(
-    backend=backend_registry.BackendType.PROCESS_GROUP,
-    store=None,
-    name=None,
-    rank=-1,
-    world_size=-1,
-    rpc_backend_options=None,
-):
-
-    _validate_rpc_args(backend, store, name, rank, world_size, rpc_backend_options)
-
-    if _is_current_rpc_agent_set():
-        raise RuntimeError("RPC is already initialized")
-
-    # Initialize RPC.
-    rpc_agent = backend_registry.init_backend(
-        backend,
-        store=store,
-        name=name,
-        rank=rank,
-        world_size=world_size,
-        rpc_backend_options=rpc_backend_options,
-    )
-
-    worker_infos = rpc_agent.get_worker_infos()
-    global _ALL_WORKER_NAMES
-    _ALL_WORKER_NAMES = {worker_info.name for worker_info in worker_infos}
-
-    _set_and_start_rpc_agent(rpc_agent)
-
-
 @_require_initialized
 def get_worker_info(worker_name=None):
     r"""
@@ -304,7 +425,7 @@ def get_worker_info(worker_name=None):
     Use this :class:`~torch.distributed.rpc.WorkerInfo` to avoid passing an
     expensive string on every invocation.
 
-    Arguments:
+    Args:
         worker_name (str): the string name of a worker. If ``None``, return the
                            the id of the current worker. (default ``None``)
 
@@ -313,41 +434,119 @@ def get_worker_info(worker_name=None):
         ``worker_name`` or :class:`~torch.distributed.rpc.WorkerInfo` of the
         current worker if ``worker_name`` is ``None``.
     """
-    if worker_name:
+    if worker_name is not None:
         return _get_current_rpc_agent().get_worker_info(worker_name)
     else:
         return _get_current_rpc_agent().get_worker_info()
 
 
-def _to_worker_info(name_or_info):
-    if isinstance(name_or_info, WorkerInfo):
-        return name_or_info
-    elif isinstance(name_or_info, str):
-        return get_worker_info(name_or_info)
+def _to_worker_info(to):
+    if isinstance(to, WorkerInfo):
+        return to
+    elif isinstance(to, (str, int)):
+        return get_worker_info(to)
     else:
-        raise ValueError("Cannot get WorkerInfo from name {}".format(name_or_info))
+        raise ValueError(f"Cannot get WorkerInfo from name {to}")
 
 
-def _validate_rpc_args(backend, store, name, rank, world_size, rpc_backend_options):
-    type_mapping = {
-        backend: backend_registry.BackendType,
-        store: dist.Store,
-        name: str,
-        rank: numbers.Integral,
-        world_size: numbers.Integral,
-        rpc_backend_options: RpcBackendOptions,
-    }
-    for arg, arg_type in type_mapping.items():
-        if not isinstance(arg, arg_type):
-            raise RuntimeError(
-                "Argument {} must be of type {} but got type {}".format(
-                    arg, arg_type, type(arg)
-                )
-            )
+def _rref_typeof_on_owner(rref, blocking: bool = True):
+    rref_type = type(rref.local_value())
+    if blocking:
+        return rref_type
+    else:
+        # Wrap result into a completed Future. This is so that if blocking=`False`
+        # is specified, we return a future regardless of if this call is on user
+        # or owner.
+        future = Future[type]()
+        future.set_result(rref_type)
+        return future
+
+
+def _rref_typeof_on_user(
+    rref, timeout: float = UNSET_RPC_TIMEOUT, blocking: bool = True
+):
+    fut = rpc_async(rref.owner(), _rref_typeof_on_owner, args=(rref,), timeout=timeout)
+    if blocking:
+        return fut.wait()
+    else:
+        return fut
+
+
+T = TypeVar("T")
+# pyrefly: ignore [invalid-annotation]
+GenericWithOneTypeVar = Generic[T]
+
+
+if TYPE_CHECKING:
+
+    class RRef(PyRRef[T], Generic[T]):
+        pass
+
+else:
+    try:
+        # Combine the implementation class and the type class.
+        class RRef(PyRRef, Generic[T]):
+            pass
+
+    except TypeError:
+        # TypeError: metaclass conflict: the metaclass of a derived class
+        # must be a (non-strict) subclass of the metaclasses of all its bases
+        # Mypy doesn't understand __class__ (mypy bug #4177)
+        class RRefMeta(PyRRef.__class__, GenericWithOneTypeVar.__class__):  # type: ignore[name-defined, misc, valid-type]
+            pass
+
+        # Combine the implementation class and the type class.
+        # Types for classes expecting a certain generic parameter (mypy bug #7791)
+        class RRef(PyRRef, GenericWithOneTypeVar, metaclass=RRefMeta):  # type: ignore[misc, no-redef, valid-type]
+            pass
+
+
+# Install docstrings from `PyRRef` to `RRef`.
+#
+# This is for the fact that pybind11 generates the parameter
+# `self` as type `rpc.PyRRef`, so a `:inherited-members:`
+# under `.. autoclass:: RRef` does not work.
+# we have to do the following process to replace `rpc.PyRRef` with `rpc.RRef`.
+#
+def method_factory(method_name, docstring):
+    def method(self, *args, **kwargs):
+        return getattr(super(RRef, self), method_name)(*args, **kwargs)
+
+    if method.__doc__:
+        method.__doc__ = docstring
+    return method
+
+
+for method_name, method in inspect.getmembers(PyRRef):
+    # Ignore magic methods, except "__str__".
+    if method_name.startswith("_") and method_name != "__str__":
+        continue
+
+    # Get pybind11 generated docstring.
+    # It's like,
+    """
+    to_here(self: torch.distributed.rpc.PyRRef, timeout: float=-1.0) -> object
+
+        Blocking call that copies the value of the RRef from the owner
+        to the local node and returns it. If the current node is the
+        owner, returns a reference to the local value.
+    """
+    docstring = getattr(method, "__doc__", None)
+    if docstring is None:
+        raise AssertionError("RRef user-facing methods should all have docstrings.")
+
+    # Do surgery on pybind11 generated docstrings.
+    docstring = docstring.replace(
+        "torch.distributed.rpc.PyRRef", "torch.distributed.rpc.RRef"
+    )
+
+    # Attach user-facing RRef method with modified docstring.
+    new_method = method_factory(method_name, docstring)
+    setattr(RRef, method_name, new_method)
 
 
 @_require_initialized
-def remote(to, func, args=None, kwargs=None):
+def remote(to, func, args=None, kwargs=None, timeout=UNSET_RPC_TIMEOUT):
     r"""
     Make a remote call to run ``func`` on worker ``to`` and return an
     :class:`~torch.distributed.rpc.RRef` to the result value immediately.
@@ -358,25 +557,32 @@ def remote(to, func, args=None, kwargs=None):
     :class:`~torch.distributed.rpc.RRef` is only destructed when globally there
     are no living references to it.
 
-    Arguments:
-        to (str or WorkerInfo): id or name of the destination worker.
-        func (callable): a callable function, such as Python callables, builtin
+    Args:
+        to (str or WorkerInfo or int): name/rank/``WorkerInfo`` of the destination worker.
+        func (Callable): a callable function, such as Python callables, builtin
                          operators (e.g. :meth:`~torch.add`) and annotated
                          TorchScript functions.
         args (tuple): the argument tuple for the ``func`` invocation.
         kwargs (dict): is a dictionary of keyword arguments for the ``func``
                        invocation.
 
+        timeout (float, optional): timeout in seconds for this remote call. If the
+                                   creation of this
+                                   :class:`~torch.distributed.rpc.RRef` on worker
+                                   ``to`` is not successfully processed on this
+                                   worker within this timeout, then the next time
+                                   there is an attempt to use the RRef (such as
+                                   ``to_here()``), a timeout will be raised
+                                   indicating this failure. A value of 0 indicates
+                                   an infinite timeout, i.e. a timeout error will
+                                   never be raised. If not provided, the default
+                                   value set during initialization or with
+                                   ``_set_rpc_timeout`` is used.
+
     Returns:
         A user :class:`~torch.distributed.rpc.RRef` instance to the result
         value. Use the blocking API :meth:`torch.distributed.rpc.RRef.to_here`
         to retrieve the result value locally.
-
-    .. warning ::
-        Using GPU tensors as arguments or return values of ``func`` is not
-        supported since we don't support sending GPU tensors over the wire. You
-        need to explicitly copy GPU tensors to CPU before using them as
-        arguments or return values of ``func``.
 
     .. warning ::
         The ``remote`` API does not copy storages of argument tensors until
@@ -386,16 +592,30 @@ def remote(to, func, args=None, kwargs=None):
         confirmed by the owner, which can be checked using the
         :meth:`torch.distributed.rpc.RRef.confirmed_by_owner` API.
 
+    .. warning ::
+        Errors such as timeouts for the ``remote`` API are handled on a
+        best-effort basis. This means that when remote calls initiated by
+        ``remote`` fail, such as with a timeout error, we take a best-effort
+        approach to error handling. This means that errors are handled and set
+        on the resulting RRef on an asynchronous basis. If the RRef has not been
+        used by the application before this handling (such as ``to_here`` or
+        fork call), then future uses of the ``RRef`` will appropriately raise
+        errors. However, it is possible that the user application will use the
+        ``RRef`` before the errors are handled. In this case, errors may not be
+        raised as they have not yet been handled.
+
     Example::
-        Make sure that ``MASTER_ADDRESS`` and ``MASTER_PORT`` are set properly
+
+        Make sure that ``MASTER_ADDR`` and ``MASTER_PORT`` are set properly
         on both workers. Refer to :meth:`~torch.distributed.init_process_group`
         API for more details. For example,
 
-        >>> export MASTER_ADDRESS=localhost
-        >>> export MASTER_port=5678
+        export MASTER_ADDR=localhost
+        export MASTER_PORT=5678
 
         Then run the following code in two different processes:
 
+        >>> # xdoctest: +SKIP
         >>> # On worker 0:
         >>> import torch
         >>> import torch.distributed.rpc as rpc
@@ -414,8 +634,8 @@ def remote(to, func, args=None, kwargs=None):
 
         >>> # On both workers:
         >>> @torch.jit.script
-        >>> def my_script_add(t1, t2):
-        >>>    return torch.add(t1, t2)
+        >>> def my_script_add(tensor: torch.Tensor, scalar: int):
+        >>>    return torch.add(tensor, scalar)
 
         >>> # On worker 0:
         >>> import torch.distributed.rpc as rpc
@@ -429,109 +649,110 @@ def remote(to, func, args=None, kwargs=None):
         >>> rpc.init_rpc("worker1", rank=1, world_size=2)
         >>> rpc.shutdown()
     """
-    qualified_name = torch.jit._find_builtin(func)
+    torch._C._log_api_usage_once("torch.distributed.rpc_remote")
+    qualified_name = torch.jit._builtins._find_builtin(func)
     dst_worker_info = _to_worker_info(to)
-    should_profile = torch.autograd._profiler_enabled()
+    should_profile = _get_should_profile()
 
-    ctx_manager = contextlib.suppress()
-    if should_profile:
-        # Create appropriate string representation based on type of func
-        # (builtin, script, python)
-        if qualified_name is None:
-            func_name = (
-                torch.jit._qualified_name(func)
-                if isinstance(func, torch.jit.ScriptFunction)
-                else func.__qualname__
-            )
-        else:
-            func_name = qualified_name
-        # Build RPC profiling key.
-        rpc_profiling_key = _build_rpc_profiling_key(
-            RPCExecMode.REMOTE,
-            func_name,
-            get_worker_info().name,
-            dst_worker_info.name,
-        )
-        ctx_manager = torch.autograd.profiler.record_function(rpc_profiling_key)
+    ctx_manager = _enable_rpc_profiler(
+        should_profile, qualified_name, func, RPCExecMode.REMOTE, dst_worker_info
+    )
 
     with ctx_manager as rf:
         args = args if args else ()
         kwargs = kwargs if kwargs else {}
+
+        is_async_exec = hasattr(func, "_wrapped_async_rpc_function")
+
+        if is_async_exec:
+            wrapped = func._wrapped_async_rpc_function
+            if isinstance(wrapped, torch.jit.ScriptFunction):
+                func = wrapped
+
         if qualified_name is not None:
-            rref = _invoke_remote_builtin(dst_worker_info, qualified_name, *args, **kwargs)
+            rref = _invoke_remote_builtin(
+                dst_worker_info, qualified_name, timeout, *args, **kwargs
+            )
         elif isinstance(func, torch.jit.ScriptFunction):
             rref = _invoke_remote_torchscript(
                 dst_worker_info.name,
                 torch._jit_internal._qualified_name(func),
+                timeout,
+                is_async_exec,
                 *args,
-                **kwargs
+                **kwargs,
             )
         else:
             (pickled_python_udf, tensors) = _default_pickler.serialize(
                 PythonUDF(func, args, kwargs)
             )
-            rref = _invoke_remote_python_udf(dst_worker_info, pickled_python_udf, tensors)
+            rref = _invoke_remote_python_udf(
+                dst_worker_info, pickled_python_udf, tensors, timeout, is_async_exec
+            )
         # attach profiling information
         if should_profile:
-            assert torch.autograd._profiler_enabled()
-            assert rf is not None
+            if not torch.autograd._profiler_enabled():
+                raise AssertionError
+            if rf is None:
+                raise AssertionError
             fut = rf._call_end_callbacks_on_future(rref._get_future())
             rref._set_profiling_future(fut)
 
     return rref
 
-def _invoke_rpc(to, func, rpc_type, args=None, kwargs=None, rpc_timeout=UNSET_RPC_TIMEOUT):
+
+def _invoke_rpc(
+    to, func, rpc_type, args=None, kwargs=None, rpc_timeout: float = UNSET_RPC_TIMEOUT
+):
     if not callable(func):
         raise TypeError("function should be callable.")
 
-    qualified_name = torch.jit._find_builtin(func)
+    qualified_name = torch.jit._builtins._find_builtin(func)
     dst_worker_info = _to_worker_info(to)
 
-    # TODO: profiling logic does not really belong in invoke_rpc, it should be
-    # added as part of a context manager or helper (https://github.com/pytorch/pytorch/issues/36360)
-    should_profile = torch.autograd._profiler_enabled()
+    should_profile = _get_should_profile()
 
-    ctx_manager = contextlib.suppress()
-    if should_profile:
-        # Create appropriate string representation based on type of func
-        # (builtin, script, python)
-        if qualified_name is None:
-            func_name = (
-                torch.jit._qualified_name(func)
-                if isinstance(func, torch.jit.ScriptFunction)
-                else func.__qualname__
-            )
-        else:
-            func_name = qualified_name
-        # Build RPC profiling key.
-        rpc_profiling_key = _build_rpc_profiling_key(
-            rpc_type,
-            func_name,
-            get_worker_info().name,
-            dst_worker_info.name,
-        )
-        ctx_manager = torch.autograd.profiler.record_function(rpc_profiling_key)
+    ctx_manager = _enable_rpc_profiler(
+        should_profile, qualified_name, func, rpc_type, dst_worker_info
+    )
 
     with ctx_manager as rf:
         args = args if args else ()
         kwargs = kwargs if kwargs else {}
 
-        is_async_fn = hasattr(func, "_wrapped_async_rpc_function")
+        is_async_exec = hasattr(func, "_wrapped_async_rpc_function")
+
+        if is_async_exec:
+            # pyrefly: ignore [missing-attribute]
+            wrapped = func._wrapped_async_rpc_function
+            if isinstance(wrapped, torch.jit.ScriptFunction):
+                func = wrapped
 
         if qualified_name is not None:
-            fut = _invoke_rpc_builtin(dst_worker_info, qualified_name, rpc_timeout, *args, **kwargs)
+            fut = _invoke_rpc_builtin(
+                dst_worker_info, qualified_name, rpc_timeout, *args, **kwargs
+            )
         elif isinstance(func, torch.jit.ScriptFunction):
             fut = _invoke_rpc_torchscript(
-                dst_worker_info.name, torch.jit._qualified_name(func), args, kwargs, rpc_timeout
+                dst_worker_info.name,
+                torch._jit_internal._qualified_name(func),
+                args,
+                kwargs,
+                rpc_timeout,
+                is_async_exec,
             )
         else:
             (pickled_python_udf, tensors) = _default_pickler.serialize(
                 PythonUDF(func, args, kwargs)
             )
-            fut = _invoke_rpc_python_udf(dst_worker_info, pickled_python_udf, tensors, rpc_timeout, is_async_fn)
+            fut = _invoke_rpc_python_udf(
+                dst_worker_info, pickled_python_udf, tensors, rpc_timeout, is_async_exec
+            )
         if should_profile:
-            assert torch.autograd._profiler_enabled()
-            assert rf is not None
+            if not torch.autograd._profiler_enabled():
+                raise AssertionError
+            if rf is None:
+                raise AssertionError
             # Schedule profiling callbacks to run when the future completes.
             # This returns a future that is completed when the original future
             # completes and the profiling callbacks have been completed as well,
@@ -542,15 +763,15 @@ def _invoke_rpc(to, func, rpc_type, args=None, kwargs=None, rpc_timeout=UNSET_RP
 
 
 @_require_initialized
-def rpc_sync(to, func, args=None, kwargs=None, timeout=UNSET_RPC_TIMEOUT):
+def rpc_sync(to, func, args=None, kwargs=None, timeout: float = UNSET_RPC_TIMEOUT):
     r"""
     Make a blocking RPC call to run function ``func`` on worker ``to``. RPC
     messages are sent and received in parallel to execution of Python code. This
     method is thread-safe.
 
-    Arguments:
-        to (str or WorkerInfo): id or name of the destination worker.
-        func (callable): a callable function, such as Python callables, builtin
+    Args:
+        to (str or WorkerInfo or int): name/rank/``WorkerInfo`` of the destination worker.
+        func (Callable): a callable function, such as Python callables, builtin
                          operators (e.g. :meth:`~torch.add`) and annotated
                          TorchScript functions.
         args (tuple): the argument tuple for the ``func`` invocation.
@@ -563,27 +784,22 @@ def rpc_sync(to, func, args=None, kwargs=None, timeout=UNSET_RPC_TIMEOUT):
                                    indicates an infinite timeout, i.e. a timeout
                                    error will never be raised. If not provided,
                                    the default value set during initialization
-                                   or with `_set_rpc_timeout` is used.
+                                   or with ``_set_rpc_timeout`` is used.
 
     Returns:
         Returns the result of running ``func`` with ``args`` and ``kwargs``.
 
-    .. warning ::
-        Using GPU tensors as arguments or return values of ``func`` is not
-        supported since we don't support sending GPU tensors over the wire. You
-        need to explicitly copy GPU tensors to CPU before using them as
-        arguments or return values of ``func``.
-
     Example::
-        Make sure that ``MASTER_ADDRESS`` and ``MASTER_PORT`` are set properly
+        Make sure that ``MASTER_ADDR`` and ``MASTER_PORT`` are set properly
         on both workers. Refer to :meth:`~torch.distributed.init_process_group`
         API for more details. For example,
 
-        >>> export MASTER_ADDRESS=localhost
-        >>> export MASTER_port=5678
+        export MASTER_ADDR=localhost
+        export MASTER_PORT=5678
 
         Then run the following code in two different processes:
 
+        >>> # xdoctest: +SKIP
         >>> # On worker 0:
         >>> import torch
         >>> import torch.distributed.rpc as rpc
@@ -600,8 +816,8 @@ def rpc_sync(to, func, args=None, kwargs=None, timeout=UNSET_RPC_TIMEOUT):
 
         >>> # On both workers:
         >>> @torch.jit.script
-        >>> def my_script_add(t1, t2):
-        >>>    return torch.add(t1, t2)
+        >>> def my_script_add(tensor: torch.Tensor, scalar: int):
+        >>>    return torch.add(tensor, scalar)
 
         >>> # On worker 0:
         >>> import torch.distributed.rpc as rpc
@@ -615,6 +831,7 @@ def rpc_sync(to, func, args=None, kwargs=None, timeout=UNSET_RPC_TIMEOUT):
         >>> rpc.shutdown()
 
     """
+    torch._C._log_api_usage_once("torch.distributed.rpc_sync")
     fut = _invoke_rpc(to, func, RPCExecMode.SYNC, args, kwargs, timeout)
     return fut.wait()
 
@@ -624,12 +841,12 @@ def rpc_async(to, func, args=None, kwargs=None, timeout=UNSET_RPC_TIMEOUT):
     r"""
     Make a non-blocking RPC call to run function ``func`` on worker ``to``. RPC
     messages are sent and received in parallel to execution of Python code. This
-    method is thread-safe. This method will immediately return a Future that can
-    be awaited on.
+    method is thread-safe. This method will immediately return a
+    :class:`~torch.futures.Future` that can be awaited on.
 
-    Arguments:
-        to (str or WorkerInfo): id or name of the destination worker.
-        func (callable): a callable function, such as Python callables, builtin
+    Args:
+        to (str or WorkerInfo or int): name/rank/``WorkerInfo`` of the destination worker.
+        func (Callable): a callable function, such as Python callables, builtin
                          operators (e.g. :meth:`~torch.add`) and annotated
                          TorchScript functions.
         args (tuple): the argument tuple for the ``func`` invocation.
@@ -642,13 +859,14 @@ def rpc_async(to, func, args=None, kwargs=None, timeout=UNSET_RPC_TIMEOUT):
                                    indicates an infinite timeout, i.e. a timeout
                                    error will never be raised. If not provided,
                                    the default value set during initialization
-                                   or with `_set_rpc_timeout` is used.
+                                   or with ``_set_rpc_timeout`` is used.
 
 
     Returns:
-        Returns a Future object that can be waited
+        Returns a :class:`~torch.futures.Future` object that can be waited
         on. When completed, the return value of ``func`` on ``args`` and
-        ``kwargs`` can be retrieved from the Future object.
+        ``kwargs`` can be retrieved from the :class:`~torch.futures.Future`
+        object.
 
     .. warning ::
         Using GPU tensors as arguments or return values of ``func`` is not
@@ -660,19 +878,20 @@ def rpc_async(to, func, args=None, kwargs=None, timeout=UNSET_RPC_TIMEOUT):
         The ``rpc_async`` API does not copy storages of argument tensors until
         sending them over the wire, which could be done by a different thread
         depending on the RPC backend type. The caller should make sure that the
-        contents of those tensors stay intact until the returned Future
-        completes.
+        contents of those tensors stay intact until the returned
+        :class:`~torch.futures.Future` completes.
 
     Example::
-        Make sure that ``MASTER_ADDRESS`` and ``MASTER_PORT`` are set properly
+        Make sure that ``MASTER_ADDR`` and ``MASTER_PORT`` are set properly
         on both workers. Refer to :meth:`~torch.distributed.init_process_group`
         API for more details. For example,
 
-        >>> export MASTER_ADDRESS=localhost
-        >>> export MASTER_port=5678
+        export MASTER_ADDR=localhost
+        export MASTER_PORT=5678
 
         Then run the following code in two different processes:
 
+        >>> # xdoctest: +SKIP
         >>> # On worker 0:
         >>> import torch
         >>> import torch.distributed.rpc as rpc
@@ -691,8 +910,8 @@ def rpc_async(to, func, args=None, kwargs=None, timeout=UNSET_RPC_TIMEOUT):
 
         >>> # On both workers:
         >>> @torch.jit.script
-        >>> def my_script_add(t1, t2):
-        >>>    return torch.add(t1, t2)
+        >>> def my_script_add(tensor: torch.Tensor, scalar: int):
+        >>>    return torch.add(tensor, scalar)
 
         >>> # On worker 0:
         >>> import torch.distributed.rpc as rpc
@@ -706,4 +925,48 @@ def rpc_async(to, func, args=None, kwargs=None, timeout=UNSET_RPC_TIMEOUT):
         >>> rpc.init_rpc("worker1", rank=1, world_size=2)
         >>> rpc.shutdown()
     """
-    return _invoke_rpc(to, func, RPCExecMode.ASYNC, args, kwargs, timeout)
+    torch._C._log_api_usage_once("torch.distributed.rpc_async")
+    fut = _invoke_rpc(to, func, RPCExecMode.ASYNC, args, kwargs, timeout)
+    if hasattr(_thread_local_var, "future_list"):
+        _thread_local_var.future_list.append(fut)
+    return fut
+
+
+def _get_should_profile():
+    # Legacy profiler should be enabled. RPC profiling is not supported with
+    # Kineto profiler.
+    ActiveProfilerType = torch._C._profiler.ActiveProfilerType
+    return (
+        torch.autograd._profiler_enabled()
+        and torch._C._autograd._profiler_type() == ActiveProfilerType.LEGACY  # type: ignore[attr-defined]
+    )
+
+
+def _enable_rpc_profiler(
+    should_profile, qualified_name, func, rpc_type, dst_worker_info
+):
+    ctx_manager = contextlib.nullcontext()
+
+    if should_profile:
+        # Create appropriate string representation based on type of func
+        # (builtin, script, python)
+        if qualified_name is None:
+            func_name = (
+                torch._jit_internal._qualified_name(func)
+                if isinstance(func, torch.jit.ScriptFunction)
+                else func.__qualname__
+            )
+        else:
+            func_name = qualified_name
+        # Build RPC profiling key.
+        rpc_profiling_key = _build_rpc_profiling_key(
+            rpc_type,
+            func_name,
+            get_worker_info().name,
+            dst_worker_info.name,
+        )
+        RemoteProfilerManager.set_current_profiling_key(rpc_profiling_key)
+        # Mypy doesn't support re-def of a variable not in the same block (#1174)
+        ctx_manager = torch.autograd.profiler.record_function(rpc_profiling_key)  # type: ignore[assignment]
+
+    return ctx_manager

@@ -1,73 +1,51 @@
 #include <torch/csrc/jit/tensorexpr/types.h>
 
-#include <torch/csrc/WindowsTorchApiMacro.h>
 #include <torch/csrc/jit/tensorexpr/exceptions.h>
 
-#include <c10/util/Logging.h>
-
-namespace torch {
-namespace jit {
-namespace tensorexpr {
-
-bool is_integral(const ScalarType& type) {
-  switch (type) {
-    case ScalarType::Bool:
-    case ScalarType::Byte:
-    case ScalarType::Char:
-    case ScalarType::Short:
-    case ScalarType::Int:
-    case ScalarType::Long:
-      return true;
-    default:
-      return false;
-  }
-
-  return false;
-}
-
-bool is_floating_point(const ScalarType& type) {
-  switch (type) {
-    case ScalarType::Half:
-    case ScalarType::Float:
-    case ScalarType::Double:
-      return true;
-    default:
-      return false;
-  }
-
-  return false;
-}
+namespace torch::jit::tensorexpr {
 
 Dtype Dtype::scalar_dtype() const {
   return ToDtype(scalar_type_);
 }
 
-// NOLINTNEXTLINE
 #define DTYPE_DEFINE(_1, n) TORCH_API Dtype k##n(ScalarType::n, 1);
 
-AT_FORALL_SCALAR_TYPES_AND2(Bool, Half, DTYPE_DEFINE)
+AT_FORALL_SCALAR_TYPES_AND7(
+    Bool,
+    Half,
+    BFloat16,
+    Float8_e5m2,
+    Float8_e5m2fnuz,
+    Float8_e4m3fn,
+    Float8_e4m3fnuz,
+    DTYPE_DEFINE)
+DTYPE_DEFINE(c10::quint8, QUInt8)
+DTYPE_DEFINE(c10::qint8, QInt8)
 
 #undef DTYPE_DEFINE
 
-TORCH_API Dtype kHandle(ScalarType::Handle, 1);
-TORCH_API Dtype kUninitialized(ScalarType::Uninitialized, 1);
-TORCH_API Dtype kVoid(ScalarType::None, 1);
+TORCH_API Dtype kHandle(ScalarType::Undefined, 1);
 
 Dtype ToDtype(ScalarType type) {
   switch (type) {
-// NOLINTNEXTLINE
 #define TYPE_CASE(_1, n) \
   case ScalarType::n:    \
     return k##n;
-    AT_FORALL_SCALAR_TYPES_AND2(Bool, Half, TYPE_CASE)
+    AT_FORALL_SCALAR_TYPES_AND7(
+        Bool,
+        Half,
+        BFloat16,
+        Float8_e5m2,
+        Float8_e5m2fnuz,
+        Float8_e4m3fn,
+        Float8_e4m3fnuz,
+        TYPE_CASE)
+    TYPE_CASE(c10::quint8, QUInt8);
+    TYPE_CASE(c10::qint8, QInt8);
 #undef TYPE_CASE
 
-    case ScalarType::Handle:
+    case ScalarType::Undefined:
       return kHandle;
-    case ScalarType::Uninitialized:
-      return kUninitialized;
-    case ScalarType::None:
-      return kVoid;
     default:
       throw unsupported_dtype();
   }
@@ -76,39 +54,8 @@ Dtype ToDtype(ScalarType type) {
 TORCH_API std::ostream& operator<<(std::ostream& stream, const Dtype& dtype) {
   stream << dtype.scalar_type_;
   if (dtype.lanes() > 1) {
-    stream << "x" << dtype.lanes();
+    stream << 'x' << dtype.lanes();
     ;
-  }
-  return stream;
-}
-
-TORCH_API std::ostream& operator<<(
-    std::ostream& stream,
-    const ScalarType& type) {
-  switch (type) {
-// NOLINTNEXTLINE
-#define TYPE_CASE(ttt, Name) \
-  case ScalarType::Name:     \
-    stream << #ttt;          \
-    break;
-
-    AT_FORALL_SCALAR_TYPES_AND2(Bool, Half, TYPE_CASE);
-#undef TYPE_CASE
-
-    case ScalarType::Undefined:
-      stream << "Undefined";
-      break;
-    case ScalarType::Handle:
-      stream << "Handle";
-      break;
-    case ScalarType::Uninitialized:
-      stream << "Uninitialized";
-      break;
-    case ScalarType::None:
-      stream << "None";
-      break;
-    default:
-      throw unsupported_dtype();
   }
   return stream;
 }
@@ -116,40 +63,62 @@ TORCH_API std::ostream& operator<<(
 int Dtype::byte_size() const {
   int scalar_size = -1;
   switch (scalar_type_) {
-// NOLINTNEXTLINE
 #define TYPE_CASE(Type, Name)   \
   case ScalarType::Name:        \
     scalar_size = sizeof(Type); \
     break;
 
-    AT_FORALL_SCALAR_TYPES_AND2(Bool, Half, TYPE_CASE);
+    AT_FORALL_SCALAR_TYPES_AND7(
+        Bool,
+        Half,
+        BFloat16,
+        Float8_e5m2,
+        Float8_e4m3fn,
+        Float8_e5m2fnuz,
+        Float8_e4m3fnuz,
+        TYPE_CASE);
+    TYPE_CASE(c10::quint8, QUInt8);
+    TYPE_CASE(c10::qint8, QInt8);
 #undef TYPE_CASE
     default:
       throw std::runtime_error(
           "invalid scalar type; " + std::to_string(scalar_type_));
   }
-  return scalar_size * lanes();
+  return static_cast<int>(scalar_size * lanes());
 }
 
 std::string Dtype::ToCppString() const {
   switch (scalar_type_) {
-// NOLINTNEXTLINE
 #define TYPE_CASE(t, n) \
   case ScalarType::n:   \
     return #t;
-    AT_FORALL_SCALAR_TYPES_AND(Bool, TYPE_CASE);
+    AT_FORALL_SCALAR_TYPES(TYPE_CASE);
 #undef TYPE_CASE
+    case ScalarType::Bool:
+      return "bool";
     case ScalarType::Half:
       return "half";
+    case ScalarType::BFloat16:
+      return "bfloat16";
+    case ScalarType::Float8_e5m2:
+      return "float8_e5m2";
+    case ScalarType::Float8_e4m3fn:
+      return "float8_e4m3fn";
+    case ScalarType::Float8_e5m2fnuz:
+      return "float8_e5m2fnuz";
+    case ScalarType::Float8_e4m3fnuz:
+      return "float8_e4m3fnuz";
+    case ScalarType::QInt8:
+      return "qint8";
+    case ScalarType::QUInt8:
+      return "quint8";
     default:
       throw unsupported_dtype();
   }
   return "invalid";
 }
 
-} // namespace tensorexpr
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit::tensorexpr
 
 namespace std {
 

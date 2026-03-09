@@ -1,15 +1,22 @@
 #include "caffe2/utils/proto_wrap.h"
-#include "caffe2/core/common.h"
 
+C10_DIAGNOSTIC_PUSH_AND_IGNORED_IF_DEFINED("-Winconsistent-missing-override")
+C10_DIAGNOSTIC_PUSH_AND_IGNORED_IF_DEFINED("-Winconsistent-missing-destructor-override")
+C10_DIAGNOSTIC_PUSH_AND_IGNORED_IF_DEFINED("-Wsuggest-override")
+C10_DIAGNOSTIC_PUSH_AND_IGNORED_IF_DEFINED("-Wdeprecated-dynamic-exception-spec")
 #include <google/protobuf/stubs/common.h>
 #include <google/protobuf/generated_message_util.h>
+C10_DIAGNOSTIC_POP()
+C10_DIAGNOSTIC_POP()
+C10_DIAGNOSTIC_POP()
+C10_DIAGNOSTIC_POP()
 
 namespace ONNX_NAMESPACE {
 
 // ONNX wrapper functions for protobuf's GetEmptyStringAlreadyInited() function
 // used to avoid duplicated global variable in the case when protobuf
 // is built with hidden visibility.
-CAFFE2_API const ::std::string& GetEmptyStringAlreadyInited() {
+TORCH_API const ::std::string& GetEmptyStringAlreadyInited() {
   return ::google::protobuf::internal::GetEmptyStringAlreadyInited();
 }
 
@@ -20,7 +27,7 @@ namespace caffe2 {
 // Caffe2 wrapper functions for protobuf's GetEmptyStringAlreadyInited() function
 // used to avoid duplicated global variable in the case when protobuf
 // is built with hidden visibility.
-CAFFE2_API const ::std::string& GetEmptyStringAlreadyInited() {
+TORCH_API const ::std::string& GetEmptyStringAlreadyInited() {
   return ::google::protobuf::internal::GetEmptyStringAlreadyInited();
 }
 
@@ -35,7 +42,7 @@ namespace torch {
 // Caffe2 wrapper functions for protobuf's GetEmptyStringAlreadyInited() function
 // used to avoid duplicated global variable in the case when protobuf
 // is built with hidden visibility.
-CAFFE2_API const ::std::string& GetEmptyStringAlreadyInited() {
+TORCH_API const ::std::string& GetEmptyStringAlreadyInited() {
   return ::google::protobuf::internal::GetEmptyStringAlreadyInited();
 }
 

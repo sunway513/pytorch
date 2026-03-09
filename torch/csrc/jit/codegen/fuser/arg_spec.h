@@ -1,16 +1,14 @@
 #pragma once
 #include <ATen/ATen.h>
 #include <ATen/core/functional.h> // fmap
-#include <torch/csrc/WindowsTorchApiMacro.h>
+#include <c10/util/hash.h>
+#include <torch/csrc/Export.h>
 #include <torch/csrc/jit/codegen/fuser/tensor_desc.h>
-#include <torch/csrc/utils/hash.h>
 
 #include <cstdint>
 #include <vector>
 
-namespace torch {
-namespace jit {
-namespace fuser {
+namespace torch::jit::fuser {
 
 // Describes the (runtime) arguments to a kernel.
 // ArgSpecs are also used as keys to lookup instantiated kernels, so
@@ -20,7 +18,7 @@ namespace fuser {
 struct TORCH_API ArgSpec {
   ArgSpec(at::TensorList inputs, const int _device)
       : descs_{c10::fmap<TensorDesc>(inputs)},
-        hash_code_{torch::get_hash(_device, inputs.size(), descs_)},
+        hash_code_{c10::get_hash(_device, inputs.size(), descs_)},
         device_{_device} {}
 
   // (Common) hash function
@@ -54,6 +52,4 @@ struct TORCH_API ArgSpec {
   int device_;
 };
 
-} // namespace fuser
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit::fuser

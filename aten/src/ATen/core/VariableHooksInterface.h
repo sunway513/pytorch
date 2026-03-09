@@ -1,7 +1,7 @@
 #pragma once
 
-#include <c10/macros/Export.h>
 #include <ATen/core/Tensor.h>
+#include <c10/macros/Export.h>
 
 // A little explanation about why this file exists at all.  We have
 // a few methods on Tensor class which require access to reified access to
@@ -16,7 +16,7 @@
 // merge the libraries inside Facebook".  Well, the problem is that there
 // are some downstream applications which are at binary size limit, and
 // incorporating all of the extra code from libtorch would push them
-// over (admarket/adreview/service:adreviewservice, see also 
+// over (admarket/adreview/service:adreviewservice, see also
 // https://github.com/pytorch/pytorch/pull/29299)  So if you want to do that,
 // we have to fix all of the services like this.
 //
@@ -29,34 +29,57 @@
 // have weird signatures that are not supported by autograd, and (2)
 // see this bug https://github.com/pytorch/pytorch/issues/30102
 
-namespace torch { namespace autograd {
+namespace torch::autograd {
 
 struct Node;
 
-}} // namespace torch::autograd
+} // namespace torch::autograd
 
-namespace at {
-namespace impl {
+namespace at::impl {
 
-struct CAFFE2_API VariableHooksInterface {
+struct TORCH_API VariableHooksInterface {
   virtual ~VariableHooksInterface() = default;
-  virtual Tensor tensor_data(const Tensor&) const = 0;
-  virtual Tensor variable_data(const Tensor&) const = 0;
-  virtual const std::shared_ptr<torch::autograd::Node>& grad_fn(const Tensor&) const = 0;
-  virtual unsigned _register_hook(const Tensor&, std::function<Tensor(const Tensor&)> hook) const = 0;
-  virtual void remove_hook(const Tensor&, unsigned pos) const = 0;
-  virtual bool is_view(const Tensor&) const = 0;
-  virtual const Tensor& base(const Tensor&) const = 0;
-  virtual const std::string& name(const Tensor&) const = 0;
+  virtual TensorBase tensor_data(const TensorBase&) const = 0;
+  virtual TensorBase variable_data(const TensorBase&) const = 0;
+  virtual const std::shared_ptr<torch::autograd::Node>& grad_fn(
+      const TensorBase&) const = 0;
+  virtual unsigned _register_hook(
+      const TensorBase&,
+      std::function<TensorBase(const TensorBase&)> hook) const = 0;
+  virtual void remove_hook(const TensorBase&, unsigned pos) const = 0;
+  virtual bool is_view(const TensorBase&) const = 0;
+  virtual const TensorBase& base(const TensorBase&) const = 0;
+  virtual const std::string& name(const TensorBase&) const = 0;
+  virtual bool is_leaf(const TensorBase&) const = 0;
+  virtual int64_t output_nr(const TensorBase&) const = 0;
+  virtual void set_data(const TensorBase&, const TensorBase&) const = 0;
+  virtual TensorBase data(const TensorBase&) const = 0;
+  virtual int64_t _version(const TensorBase&) const = 0;
+  virtual void retain_grad(const TensorBase&) const = 0;
+  virtual bool retains_grad(const TensorBase&) const = 0;
+  virtual void _backward(
+      const Tensor&,
+      TensorList,
+      const std::optional<Tensor>&,
+      std::optional<bool>,
+      bool) const = 0;
+  virtual void requires_grad_(const TensorBase&, bool) const = 0;
+  virtual void basic_autograd_not_implemented_fallback(
+      const c10::OperatorHandle& op,
+      c10::DispatchKeySet dispatch_keys,
+      torch::jit::Stack* stack) const = 0;
+  virtual std::optional<c10::ScalarType> grad_dtype(const TensorBase&) const = 0;
+  virtual void set_grad_dtype(const TensorBase&, const std::optional<c10::ScalarType>&) const = 0;
 };
 
-CAFFE2_API void SetVariableHooks(VariableHooksInterface* hooks);
-CAFFE2_API VariableHooksInterface* GetVariableHooks();
+TORCH_API void SetVariableHooks(VariableHooksInterface* hooks);
+TORCH_API VariableHooksInterface* GetVariableHooks();
+TORCH_API bool HasVariableHooks();
 
-struct CAFFE2_API VariableHooksRegisterer {
+struct TORCH_API VariableHooksRegisterer {
   explicit VariableHooksRegisterer(VariableHooksInterface* hooks) {
     SetVariableHooks(hooks);
   }
 };
 
-}} // namespace at::impl
+} // namespace at::impl

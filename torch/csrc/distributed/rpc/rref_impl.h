@@ -2,16 +2,15 @@
 
 #include <ATen/core/jit_type.h>
 #include <ATen/core/rref_interface.h>
-#include <c10/util/Optional.h>
+#include <c10/core/Event.h>
 #include <torch/csrc/distributed/rpc/message.h>
 #include <torch/csrc/distributed/rpc/rpc_agent.h>
 #include <torch/csrc/distributed/rpc/types.h>
+#include <optional>
 
 #include <atomic>
 
-namespace torch {
-namespace distributed {
-namespace rpc {
+namespace torch::distributed::rpc {
 
 class RRef;
 class RRefContext;
@@ -30,10 +29,15 @@ constexpr int RFD_TUPLE_SIZE = 7; // number of RRefForkData fields in py::tuple
 
 // Represents fork of an RRef to be sent over the wire.
 struct TORCH_API RRefForkData {
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members)
   const worker_id_t ownerId_;
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members)
   const RRefId rrefId_;
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members)
   const ForkId forkId_;
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members)
   const worker_id_t parent_;
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members)
   const std::string typeStr_;
 
   RRefForkData(
@@ -195,7 +199,7 @@ class TORCH_API RRef : public RRefInterface {
   explicit RRef(RRef&& other) = delete;
   RRef& operator=(RRef&& other) = delete;
 
-  virtual ~RRef() = default;
+  ~RRef() override = default;
 
   // returns the worker id of the owner
   inline worker_id_t owner() const override {
@@ -205,6 +209,11 @@ class TORCH_API RRef : public RRefInterface {
   // returns the worker name of the owner
   inline std::string ownerName() const override {
     return RpcAgent::getCurrentRpcAgent()->getWorkerInfo(ownerId_).name_;
+  }
+
+  // returns the worker info of the owner
+  inline WorkerInfo ownerWorkerInfo() const {
+    return RpcAgent::getCurrentRpcAgent()->getWorkerInfo(ownerId_);
   }
 
   // Returns the globally unique RRefId of this RRef
@@ -223,14 +232,22 @@ class TORCH_API RRef : public RRefInterface {
   // node. Note that this is only set when processing requests invoked with
   // rpc.remote. This is only used to get the future corresponding to the rref
   // for profiling use cases.
-  inline void registerOwnerCreationFuture(std::shared_ptr<FutureMessage> fut) {
+  inline void registerOwnerCreationFuture(c10::intrusive_ptr<JitFuture> fut) {
     ownerCreationFuture_ = std::move(fut);
   }
 
   // Get the future corresponding to the creation of this rref.
-  inline std::shared_ptr<FutureMessage> getOwnerCreationFuture() const {
+  inline c10::intrusive_ptr<JitFuture> getOwnerCreationFuture() const {
     return ownerCreationFuture_;
   }
+
+  // Check if creation of this RRef on owner node has timed out.
+  inline bool getTimedOut() const {
+    return timedOut_.load();
+  }
+
+  // Dispatches an error to the correct handler based on its RPCErrorType.
+  void handleError(RPCErrorType errorType, const JitFuture& JitFuture);
 
   // Send delete UserRRef request to Owner,
   // if the request hasn't been sent yet.
@@ -241,20 +258,30 @@ class TORCH_API RRef : public RRefInterface {
   virtual void tryDel() {}
 
  protected:
+  // Indicates that the creation of this RRef on owner node has timed out.
+  inline void setTimedOut() {
+    timedOut_ = true;
+  }
   friend class RRefContext;
 
   RRef(worker_id_t ownerId, const RRefId& rrefId, TypePtr type);
 
   virtual RRefForkData fork() const;
 
+  // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
   const worker_id_t ownerId_;
+  // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
   const RRefId rrefId_;
+  // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
+  std::atomic<bool> timedOut_{false};
 
   // type field to denote the type of the element that the RRef is holding
   // it could be any TypePtr that JIT support, including PyObjectType
+  // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
   const TypePtr type_;
   // Future corresponding to request to create RRef on remote node.
-  std::shared_ptr<FutureMessage> ownerCreationFuture_;
+  // NOLINTNEXTLINE(cppcoreguidelines-non-private-member-variables-in-classes)
+  c10::intrusive_ptr<JitFuture> ownerCreationFuture_;
 };
 
 // ``UserRRef`` represents a user of an RRef. Besides the ``RRefId``, each user
@@ -287,7 +314,9 @@ class TORCH_API UserRRef final : public RRef {
 
   // Get of copy of the value from the ``OwnerRRef``. If the value is not ready
   // yet, this call will block.
-  IValue toHere() const;
+  IValue toHere(
+      const float timeoutSeconds =
+          torch::distributed::rpc::kUnsetRpcTimeout) const;
 
   void tryDel() override;
 
@@ -298,8 +327,8 @@ class TORCH_API UserRRef final : public RRef {
   // Will be called when both refcount and weakcount reach 0. See
   // https://github.com/pytorch/pytorch/blob/9116f02bebf3a5260feef5732d36c54ecb3b4033/c10/util/intrusive_ptr.h#L204
   // This is called on destructing the wrapping intrusive_ptr_target instance
-  // and it's data members. We don't need to implement anything here.
-  ~UserRRef() = default;
+  // and it's data members.
+  ~UserRRef() override;
 
  private:
   friend class RRefContext;
@@ -330,20 +359,18 @@ class TORCH_API OwnerRRef final : public RRef {
   OwnerRRef& operator=(const OwnerRRef& other) = delete;
   OwnerRRef& operator=(OwnerRRef&& other) = delete;
 
-  OwnerRRef(worker_id_t ownerId, const RRefId& rrefId, TypePtr type)
-      : OwnerRRef(ownerId, rrefId, type, {}) {}
+  OwnerRRef(
+      worker_id_t ownerId,
+      const RRefId& rrefId,
+      TypePtr type,
+      std::vector<c10::Device> devices);
 
   OwnerRRef(
       worker_id_t ownerId,
       const RRefId& rrefId,
       TypePtr type,
-      c10::optional<IValue> value)
-      : RRef(ownerId, rrefId, type) {
-    future_ = std::make_shared<JitFuture>(type);
-    if (value.has_value()) {
-      future_->markCompleted(value.value());
-    }
-  }
+      std::optional<IValue> value,
+      std::vector<c10::Device> devices);
 
   inline bool isOwner() const override {
     return true;
@@ -364,19 +391,31 @@ class TORCH_API OwnerRRef final : public RRef {
   // does not create any new py::object.
   void setValue(IValue&& value);
   // Sets the value of this ``OwnerRRef`` to contain an exception.
-  void setError(const std::string& err);
+  void setError(std::exception_ptr eptr);
 
   // Has a value or error been set?
   bool hasValue() const;
   // Gets a future that is satisfied when the value or error is set.
-  std::shared_ptr<JitFuture> getFuture();
+  c10::intrusive_ptr<JitFuture> getFuture();
 
  private:
   friend class RRefContext;
 
-  std::shared_ptr<JitFuture> future_;
+  c10::intrusive_ptr<JitFuture> future_;
 };
 
-} // namespace rpc
-} // namespace distributed
-} // namespace torch
+TORCH_API std::ostream& operator<<(std::ostream& os, const RRef& rref);
+
+// Helper function that casts from c10::RRefInterface to OwnerRRef
+inline TORCH_API c10::intrusive_ptr<OwnerRRef> fromRRefInterface(
+    const c10::intrusive_ptr<c10::RRefInterface>& rrefInterface) {
+  return c10::static_intrusive_pointer_cast<OwnerRRef>(rrefInterface);
+}
+
+// Helper function that casts from OwnerRRef to c10::RRefInterface
+inline TORCH_API c10::intrusive_ptr<c10::RRefInterface> fromOwnerRRef(
+    const c10::intrusive_ptr<RRef>& ownerRRef) {
+  return c10::static_intrusive_pointer_cast<c10::RRefInterface>(ownerRRef);
+}
+
+} // namespace torch::distributed::rpc

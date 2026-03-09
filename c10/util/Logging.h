@@ -8,6 +8,7 @@
 #include <sstream>
 
 #include <c10/macros/Macros.h>
+#include <c10/util/Backtrace.h>
 #include <c10/util/Exception.h>
 #include <c10/util/Flags.h>
 #include <c10/util/StringUtil.h>
@@ -56,7 +57,9 @@ C10_DECLARE_bool(caffe2_use_fatal_for_enforce);
 
 namespace c10 {
 
+#if !defined(C10_NODEPRECATED)
 using std::string;
+#endif
 
 // Functions that we use for initialization.
 C10_API bool InitCaffeLogging(int* argc, char** argv);
@@ -69,12 +72,44 @@ C10_API void UpdateLoggingLevelsFromFlags();
     const std::string& msg,
     const void* caller = nullptr);
 
+[[noreturn]] C10_API void ThrowEnforceNotMet(
+    const char* file,
+    const int line,
+    const char* condition,
+    const char* msg,
+    const void* caller = nullptr);
+
+[[noreturn]] inline void ThrowEnforceNotMet(
+    const char* file,
+    const int line,
+    const char* condition,
+    detail::CompileTimeEmptyString /*msg*/,
+    const void* caller = nullptr) {
+  ThrowEnforceNotMet(file, line, condition, "", caller);
+}
+
 [[noreturn]] C10_API void ThrowEnforceFiniteNotMet(
     const char* file,
     const int line,
     const char* condition,
     const std::string& msg,
     const void* caller = nullptr);
+
+[[noreturn]] C10_API void ThrowEnforceFiniteNotMet(
+    const char* file,
+    const int line,
+    const char* condition,
+    const char* msg,
+    const void* caller = nullptr);
+
+[[noreturn]] inline void ThrowEnforceFiniteNotMet(
+    const char* file,
+    const int line,
+    const char* condition,
+    detail::CompileTimeEmptyString /*msg*/,
+    const void* caller = nullptr) {
+  ThrowEnforceFiniteNotMet(file, line, condition, "", caller);
+}
 
 constexpr bool IsUsingGoogleLogging() {
 #ifdef C10_USE_GLOG
@@ -94,7 +129,13 @@ constexpr bool IsUsingGoogleLogging() {
  */
 C10_API void ShowLogInfoToStderr();
 
-C10_API void SetStackTraceFetcher(std::function<string(void)> fetcher);
+C10_API void SetStackTraceFetcher(std::function<::c10::Backtrace()> fetcher);
+
+/**
+ * Convenience function for non-lazy stack trace fetchers. The Backtrace
+ * overload should be preferred when stringifying the backtrace is expensive.
+ */
+C10_API void SetStackTraceFetcher(std::function<std::string()> fetcher);
 
 using EnforceNotMet = ::c10::Error;
 
@@ -107,12 +148,12 @@ using EnforceNotMet = ::c10::Error;
   } while (false)
 
 #define CAFFE_ENFORCE_FINITE(condition, ...)                        \
-    do {                                                            \
-      if (C10_UNLIKELY(!(condition))) {                             \
-        ::c10::ThrowEnforceFiniteNotMet(                            \
+  do {                                                              \
+    if (C10_UNLIKELY(!(condition))) {                               \
+      ::c10::ThrowEnforceFiniteNotMet(                              \
           __FILE__, __LINE__, #condition, ::c10::str(__VA_ARGS__)); \
-      }                                                             \
-    } while (false)
+    }                                                               \
+  } while (false)
 
 #define CAFFE_ENFORCE_WITH_CALLER(condition, ...)                         \
   do {                                                                    \
@@ -148,143 +189,135 @@ using EnforceNotMet = ::c10::Error;
  * With further usages like `CAFFE_ENFORCE_THAT(IsVector(Input(0).dims()))`
  *
  * Convenient wrappers for binary operations like CAFFE_ENFORCE_EQ are provided
- * too. Please use them instead of CHECK_EQ and friends for failures in
+ * too. Please use them instead of TORCH_CHECK_EQ and friends for failures in
  * user-provided input.
  */
 
 namespace enforce_detail {
 
-struct C10_API EnforceOK {};
+template <typename T1, typename T2>
+std::string enforceFailMsgImpl(const T1& x, const T2& y) {
+  return c10::str(x, " vs ", y);
+}
 
-class C10_API EnforceFailMessage {
- public:
-#ifdef _MSC_VER
-  // MSVC + NVCC ignores constexpr and will issue a warning if included.
-  /* implicit */ EnforceFailMessage(EnforceOK) : msg_(nullptr) {}
-#else
-  constexpr /* implicit */ EnforceFailMessage(EnforceOK) : msg_(nullptr) {}
-#endif
-  EnforceFailMessage(EnforceFailMessage&&) = default;
-  EnforceFailMessage(const EnforceFailMessage&) = delete;
-  EnforceFailMessage& operator=(EnforceFailMessage&&) = delete;
-  EnforceFailMessage& operator=(const EnforceFailMessage&) = delete;
+template <typename T1, typename T2, typename... Args>
+std::string enforceFailMsgImpl(const T1& x, const T2& y, const Args&... args) {
+  return c10::str(x, " vs ", y, ". ", args...);
+}
 
-  // Catch all wrong usages like CAFFE_ENFORCE_THAT(x < y)
-  template <class... Args>
-  /* implicit */ EnforceFailMessage(Args...) {
-    static_assert(
-        // This stands for an "impossible" condition. Plain `false` doesn't
-        // trick compiler enough.
-        sizeof...(Args) == std::numeric_limits<std::size_t>::max(),
-        "CAFFE_ENFORCE_THAT has to be used with one of special check functions "
-        "like `Equals`. Use CAFFE_ENFORCE for simple boolean checks.");
+template <typename Pred, typename T1, typename T2, typename GetFailMsgFunc>
+void enforceThatImpl(
+    Pred p,
+    const T1& lhs,
+    const T2& rhs,
+    const char* file,
+    int line,
+    const char* expr,
+    const void* caller,
+    GetFailMsgFunc getFailMsg) {
+  if (C10_UNLIKELY(!(p(lhs, rhs)))) {
+    ::c10::ThrowEnforceNotMet(file, line, expr, getFailMsg(lhs, rhs), caller);
   }
+}
 
-  /* implicit */ EnforceFailMessage(std::string&& msg);
+#define CAFFE_ENFORCE_THAT_IMPL(op, lhs, rhs, expr, ...)  \
+  ::c10::enforce_detail::enforceThatImpl(                 \
+      op,                                                 \
+      (lhs),                                              \
+      (rhs),                                              \
+      __FILE__,                                           \
+      __LINE__,                                           \
+      expr,                                               \
+      nullptr,                                            \
+      [&](const auto& arg1, const auto& arg2) {           \
+        return ::c10::enforce_detail::enforceFailMsgImpl( \
+            arg1, arg2, ##__VA_ARGS__);                   \
+      })
 
-  inline bool bad() const {
-    return msg_ != nullptr;
-  }
-  std::string get_message_and_free(const std::string& extra) const {
-    std::string r;
-    if (extra.empty()) {
-      r = std::move(*msg_);
-    } else {
-      r = ::c10::str(std::move(*msg_), ". ", extra);
-    }
-    delete msg_;
-    return r;
-  }
+#define CAFFE_ENFORCE_THAT_IMPL_WITH_CALLER(op, lhs, rhs, expr, ...) \
+  ::c10::enforce_detail::enforceThatImpl(                            \
+      op,                                                            \
+      (lhs),                                                         \
+      (rhs),                                                         \
+      __FILE__,                                                      \
+      __LINE__,                                                      \
+      expr,                                                          \
+      this,                                                          \
+      [&](const auto& arg1, const auto& arg2) {                      \
+        return ::c10::enforce_detail::enforceFailMsgImpl(            \
+            arg1, arg2, ##__VA_ARGS__);                              \
+      })
 
- private:
-  std::string* msg_{};
-};
-
-#define BINARY_COMP_HELPER(name, op)                         \
-  template <typename T1, typename T2>                        \
-  inline EnforceFailMessage name(const T1& x, const T2& y) { \
-    if (x op y) {                                            \
-      return EnforceOK();                                    \
-    }                                                        \
-    return c10::str(x, " vs ", y);                           \
-  }
-BINARY_COMP_HELPER(Equals, ==)
-BINARY_COMP_HELPER(NotEquals, !=)
-BINARY_COMP_HELPER(Greater, >)
-BINARY_COMP_HELPER(GreaterEquals, >=)
-BINARY_COMP_HELPER(Less, <)
-BINARY_COMP_HELPER(LessEquals, <=)
-#undef BINARY_COMP_HELPER
-
-#define CAFFE_ENFORCE_THAT_IMPL(condition, expr, ...)                   \
-  do {                                                                  \
-    using namespace ::c10::enforce_detail;                              \
-    const EnforceFailMessage& CAFFE_ENFORCE_THAT_IMPL_r_ = (condition); \
-    if (C10_UNLIKELY(CAFFE_ENFORCE_THAT_IMPL_r_.bad())) {               \
-      ::c10::ThrowEnforceNotMet(                                        \
-          __FILE__,                                                     \
-          __LINE__,                                                     \
-          expr,                                                         \
-          CAFFE_ENFORCE_THAT_IMPL_r_.get_message_and_free(              \
-              ::c10::str(__VA_ARGS__)));                                \
-    }                                                                   \
-  } while (false)
-
-#define CAFFE_ENFORCE_THAT_IMPL_WITH_CALLER(condition, expr, ...)      \
-  do {                                                                 \
-    using namespace ::c10::enforce_detail;                             \
-    const EnforceFailMessage& CAFFE_ENFORCE_THAT_IMPL_WITH_CALLER_r_ = \
-        (condition);                                                   \
-    if (C10_UNLIKELY(CAFFE_ENFORCE_THAT_IMPL_WITH_CALLER_r_.bad())) {  \
-      ::c10::ThrowEnforceNotMet(                                       \
-          __FILE__,                                                    \
-          __LINE__,                                                    \
-          expr,                                                        \
-          CAFFE_ENFORCE_THAT_IMPL_WITH_CALLER_r_.get_message_and_free( \
-              ::c10::str(__VA_ARGS__)),                                \
-          this);                                                       \
-    }                                                                  \
-  } while (false)
 } // namespace enforce_detail
 
-#define CAFFE_ENFORCE_THAT(condition, ...) \
-  CAFFE_ENFORCE_THAT_IMPL((condition), #condition, __VA_ARGS__)
+#define CAFFE_ENFORCE_THAT(cmp, op, lhs, rhs, ...) \
+  CAFFE_ENFORCE_THAT_IMPL(cmp, lhs, rhs, #lhs " " #op " " #rhs, ##__VA_ARGS__)
 
+#define CAFFE_ENFORCE_BINARY_OP(cmp, op, x, y, ...) \
+  CAFFE_ENFORCE_THAT_IMPL(cmp, x, y, #x " " #op " " #y, ##__VA_ARGS__)
 #define CAFFE_ENFORCE_EQ(x, y, ...) \
-  CAFFE_ENFORCE_THAT_IMPL(Equals((x), (y)), #x " == " #y, __VA_ARGS__)
+  CAFFE_ENFORCE_BINARY_OP(std::equal_to<void>(), ==, x, y, ##__VA_ARGS__)
 #define CAFFE_ENFORCE_NE(x, y, ...) \
-  CAFFE_ENFORCE_THAT_IMPL(NotEquals((x), (y)), #x " != " #y, __VA_ARGS__)
+  CAFFE_ENFORCE_BINARY_OP(std::not_equal_to<void>(), !=, x, y, ##__VA_ARGS__)
 #define CAFFE_ENFORCE_LE(x, y, ...) \
-  CAFFE_ENFORCE_THAT_IMPL(LessEquals((x), (y)), #x " <= " #y, __VA_ARGS__)
+  CAFFE_ENFORCE_BINARY_OP(std::less_equal<void>(), <=, x, y, ##__VA_ARGS__)
 #define CAFFE_ENFORCE_LT(x, y, ...) \
-  CAFFE_ENFORCE_THAT_IMPL(Less((x), (y)), #x " < " #y, __VA_ARGS__)
+  CAFFE_ENFORCE_BINARY_OP(std::less<void>(), <, x, y, ##__VA_ARGS__)
 #define CAFFE_ENFORCE_GE(x, y, ...) \
-  CAFFE_ENFORCE_THAT_IMPL(GreaterEquals((x), (y)), #x " >= " #y, __VA_ARGS__)
+  CAFFE_ENFORCE_BINARY_OP(std::greater_equal<void>(), >=, x, y, ##__VA_ARGS__)
 #define CAFFE_ENFORCE_GT(x, y, ...) \
-  CAFFE_ENFORCE_THAT_IMPL(Greater((x), (y)), #x " > " #y, __VA_ARGS__)
+  CAFFE_ENFORCE_BINARY_OP(std::greater<void>(), >, x, y, ##__VA_ARGS__)
+
+#define CAFFE_ENFORCE_BINARY_OP_WITH_CALLER(cmp, op, x, y, ...) \
+  CAFFE_ENFORCE_THAT_IMPL_WITH_CALLER(                          \
+      cmp, x, y, #x " " #op " " #y, ##__VA_ARGS__)
 #define CAFFE_ENFORCE_EQ_WITH_CALLER(x, y, ...) \
-  CAFFE_ENFORCE_THAT_IMPL_WITH_CALLER(          \
-      Equals((x), (y)), #x " == " #y, __VA_ARGS__)
+  CAFFE_ENFORCE_BINARY_OP_WITH_CALLER(          \
+      std::equal_to<void>(), ==, x, y, ##__VA_ARGS__)
 #define CAFFE_ENFORCE_NE_WITH_CALLER(x, y, ...) \
-  CAFFE_ENFORCE_THAT_IMPL_WITH_CALLER(          \
-      NotEquals((x), (y)), #x " != " #y, __VA_ARGS__)
+  CAFFE_ENFORCE_BINARY_OP_WITH_CALLER(          \
+      std::not_equal_to<void>(), !=, x, y, ##__VA_ARGS__)
 #define CAFFE_ENFORCE_LE_WITH_CALLER(x, y, ...) \
-  CAFFE_ENFORCE_THAT_IMPL_WITH_CALLER(          \
-      LessEquals((x), (y)), #x " <= " #y, __VA_ARGS__)
+  CAFFE_ENFORCE_BINARY_OP_WITH_CALLER(          \
+      std::less_equal<void>(), <=, x, y, ##__VA_ARGS__)
 #define CAFFE_ENFORCE_LT_WITH_CALLER(x, y, ...) \
-  CAFFE_ENFORCE_THAT_IMPL_WITH_CALLER(Less((x), (y)), #x " < " #y, __VA_ARGS__)
+  CAFFE_ENFORCE_BINARY_OP_WITH_CALLER(std::less<void>(), <, x, y, ##__VA_ARGS__)
 #define CAFFE_ENFORCE_GE_WITH_CALLER(x, y, ...) \
-  CAFFE_ENFORCE_THAT_IMPL_WITH_CALLER(          \
-      GreaterEquals((x), (y)), #x " >= " #y, __VA_ARGS__)
+  CAFFE_ENFORCE_BINARY_OP_WITH_CALLER(          \
+      std::greater_equal<void>(), >=, x, y, ##__VA_ARGS__)
 #define CAFFE_ENFORCE_GT_WITH_CALLER(x, y, ...) \
-  CAFFE_ENFORCE_THAT_IMPL_WITH_CALLER(          \
-      Greater((x), (y)), #x " > " #y, __VA_ARGS__)
+  CAFFE_ENFORCE_BINARY_OP_WITH_CALLER(          \
+      std::greater<void>(), >, x, y, ##__VA_ARGS__)
+
+struct IValue;
+class C10_API EventSampledHandler {
+ public:
+  virtual void log(
+      std::string_view model_id,
+      const std::vector<c10::IValue>& args) = 0;
+  virtual ~EventSampledHandler() = default;
+};
+
+#define C10_LOG_EVENT_SAMPLED(event, ...)                                    \
+  static const std::unique_ptr<::c10::EventSampledHandler>&                  \
+      _##event##EventSampledHandler = ::c10::GetEventSampledHandler(#event); \
+  if (_##event##EventSampledHandler) {                                       \
+    _##event##EventSampledHandler->log(__VA_ARGS__);                         \
+  }
+
+// Must be called in the main thread before any other threads are spawned.
+C10_API void InitEventSampledHandlers(
+    std::vector<std::pair<
+        std::string_view,
+        std::unique_ptr<EventSampledHandler>>> /*handlers*/);
+C10_API const std::unique_ptr<EventSampledHandler>& GetEventSampledHandler(
+    std::string_view /*event*/);
 
 /**
  * Very lightweight logging for the first time API usage. It's beneficial for
  * tracking of individual functionality usage in larger applications.
  *
- * In order to ensure light-weightness of logging, we utilize static variable
+ * In order to ensure light-weightedness of logging, we utilize static variable
  * trick - LogAPIUsage will be invoked only once and further invocations will
  * just do an atomic check.
  *
@@ -292,18 +325,48 @@ BINARY_COMP_HELPER(LessEquals, <=)
  *   // Logs caller info with an arbitrary text event, if there is a usage.
  *   C10_LOG_API_USAGE_ONCE("my_api");
  */
-#define C10_LOG_API_USAGE_ONCE(...)             \
-  C10_UNUSED static bool C10_ANONYMOUS_VARIABLE(logFlag) = \
+#define C10_LOG_API_USAGE_ONCE(...)                              \
+  [[maybe_unused]] static bool C10_ANONYMOUS_VARIABLE(logFlag) = \
       ::c10::detail::LogAPIUsageFakeReturn(__VA_ARGS__);
 
 // API usage logging capabilities
 C10_API void SetAPIUsageLogger(std::function<void(const std::string&)> logger);
 C10_API void LogAPIUsage(const std::string& context);
 
+C10_API void SetAPIUsageMetadataLogger(
+    std::function<void(
+        const std::string&,
+        const std::map<std::string, std::string>& metadata_map)> logger);
+C10_API void LogAPIUsageMetadata(
+    const std::string& context,
+    const std::map<std::string, std::string>& metadata_map);
+
+// PyTorch ddp usage logging capabilities
+// DDPLoggingData holds data that can be logged in applications
+// for analysis and debugging. Data structure is defined in
+// c10 directory so that it can be easily imported by both c10
+// and torch files.
+struct DDPLoggingData {
+  // logging fields that are string types.
+  std::map<std::string, std::string> strs_map;
+  // logging fields that are int64_t types.
+  std::map<std::string, int64_t> ints_map;
+};
+
+C10_API void SetPyTorchDDPUsageLogger(
+    std::function<void(const DDPLoggingData&)> logger);
+C10_API void LogPyTorchDDPUsage(const DDPLoggingData& ddpData);
+
 namespace detail {
 // Return value is needed to do the static variable initialization trick
 C10_API bool LogAPIUsageFakeReturn(const std::string& context);
-}
+} // namespace detail
+
+// Initializes the c10 logger.
+C10_API void initLogging();
+
+// Sets the rank, which will be included in log messages
+C10_API void SetGlobalRank(int64_t rank);
 
 } // namespace c10
 

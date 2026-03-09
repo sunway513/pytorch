@@ -5,11 +5,6 @@ macro(custom_protobuf_find)
   option(protobuf_BUILD_TESTS "" OFF)
   option(protobuf_BUILD_EXAMPLES "" OFF)
   option(protobuf_WITH_ZLIB "" OFF)
-  if(APPLE)
-    # Protobuf generated files triggers a deprecated atomic operation warning
-    # so we turn it off here.
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-deprecated-declarations")
-  endif()
   if(${CAFFE2_LINK_LOCAL_PROTOBUF})
     # If we are going to link protobuf locally, we will need to turn off
     # shared libs build for protobuf.
@@ -38,21 +33,14 @@ macro(custom_protobuf_find)
   set(__caffe2_CMAKE_POSITION_INDEPENDENT_CODE ${CMAKE_POSITION_INDEPENDENT_CODE})
   set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-  if(MSVC)
-    if(MSVC_Z7_OVERRIDE)
-      foreach(flag_var
-          CMAKE_C_FLAGS CMAKE_C_FLAGS_DEBUG CMAKE_C_FLAGS_RELEASE
-          CMAKE_C_FLAGS_MINSIZEREL CMAKE_C_FLAGS_RELWITHDEBINFO
-          CMAKE_CXX_FLAGS CMAKE_CXX_FLAGS_DEBUG CMAKE_CXX_FLAGS_RELEASE
-          CMAKE_CXX_FLAGS_MINSIZEREL CMAKE_CXX_FLAGS_RELWITHDEBINFO)
-        if(${flag_var} MATCHES "/Z[iI]")
-          string(REGEX REPLACE "/Z[iI]" "/Z7" ${flag_var} "${${flag_var}}")
-        endif(${flag_var} MATCHES "/Z[iI]")
-      endforeach(flag_var)
-    endif(MSVC_Z7_OVERRIDE)
-  endif(MSVC)
-
-  add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../third_party/protobuf/cmake)
+  if(CMAKE_VERSION VERSION_GREATER_EQUAL "4.0.0")
+    message(WARNING "Ancient protobuf forces CMake compatibility")
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../third_party/protobuf/cmake)
+    unset(CMAKE_POLICY_VERSION_MINIMUM)
+  else()
+    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../third_party/protobuf/cmake)
+  endif()
 
   set(CMAKE_POSITION_INDEPENDENT_CODE ${__caffe2_CMAKE_POSITION_INDEPENDENT_CODE})
 
@@ -80,7 +68,7 @@ endmacro()
 # coded BUILD_CUSTOM_PROTOBUF, we will hard code the use of custom protobuf
 # in the submodule.
 if(ANDROID OR IOS)
-  if(NOT ${BUILD_CUSTOM_PROTOBUF})
+  if(NOT BUILD_CUSTOM_PROTOBUF)
     message(WARNING
         "For Android and iOS cross compilation, I am automatically using "
         "custom protobuf under third party. Note that this behavior may "
@@ -167,8 +155,8 @@ function(caffe2_protobuf_generate_cpp_py srcs_var hdrs_var python_var)
     list(APPEND ${hdrs_var} "${CMAKE_CURRENT_BINARY_DIR}/${fil_we}.pb.h")
     list(APPEND ${python_var} "${CMAKE_CURRENT_BINARY_DIR}/${fil_we}_pb2.py")
 
-    # Add CAFFE2_API prefix to protobuf classes and methods in all cases
-    set(DLLEXPORT_STR "dllexport_decl=CAFFE2_API:")
+    # Add TORCH_API prefix to protobuf classes and methods in all cases
+    set(DLLEXPORT_STR "dllexport_decl=TORCH_API:")
 
     # Note: the following depends on PROTOBUF_PROTOC_EXECUTABLE. This
     # is done to make sure protoc is built before attempting to
@@ -204,6 +192,7 @@ function(caffe2_protobuf_generate_cpp_py srcs_var hdrs_var python_var)
         COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}"
         COMMAND ${CAFFE2_PROTOC_EXECUTABLE} -I${PROJECT_SOURCE_DIR} --cpp_out=${DLLEXPORT_STR}${PROJECT_BINARY_DIR} ${abs_fil}
         COMMAND ${CAFFE2_PROTOC_EXECUTABLE} -I${PROJECT_SOURCE_DIR} --python_out "${PROJECT_BINARY_DIR}" ${abs_fil}
+        COMMAND ${CMAKE_COMMAND} -DFILENAME=${CMAKE_CURRENT_BINARY_DIR}/${fil_we}.pb.h -DNAMESPACES=caffe\;caffe2\;onnx\;torch -DSYSTEM_PROTOBUF=YES -P ${PROJECT_SOURCE_DIR}/cmake/ProtoBufPatch.cmake
         DEPENDS ${CAFFE2_PROTOC_EXECUTABLE} ${abs_fil}
         COMMENT "Running C++/Python protocol buffer compiler on ${fil}" VERBATIM )
     endif()

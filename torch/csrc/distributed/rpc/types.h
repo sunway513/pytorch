@@ -1,19 +1,22 @@
 #pragma once
 
 #include <ATen/core/ivalue.h>
-#include <atomic>
 
-namespace torch {
-namespace distributed {
-namespace rpc {
+namespace torch::distributed::rpc {
 
 using worker_id_t = int16_t;
 using local_id_t = int64_t;
 
 bool getAllowJitRRefPickle();
+TORCH_API void enableJitRRefPickle();
+TORCH_API void disableJitRRefPickle();
 
 struct TORCH_API JitRRefPickleGuard {
   JitRRefPickleGuard();
+  JitRRefPickleGuard(JitRRefPickleGuard&& other) = delete;
+  JitRRefPickleGuard(const JitRRefPickleGuard&) = delete;
+  JitRRefPickleGuard& operator=(const JitRRefPickleGuard&) = delete;
+  JitRRefPickleGuard& operator=(JitRRefPickleGuard&&) = delete;
   ~JitRRefPickleGuard();
 };
 
@@ -21,12 +24,15 @@ struct TORCH_API GloballyUniqueId final {
   GloballyUniqueId(worker_id_t createdOn, local_id_t localId);
   GloballyUniqueId(const GloballyUniqueId& other) = default;
   GloballyUniqueId& operator=(const GloballyUniqueId& other) = delete;
+  GloballyUniqueId(GloballyUniqueId&& other) = default;
+  GloballyUniqueId& operator=(GloballyUniqueId&& other) = delete;
+  ~GloballyUniqueId() = default;
 
   bool operator==(const GloballyUniqueId& other) const;
   bool operator!=(const GloballyUniqueId& other) const;
 
   at::IValue toIValue() const;
-  static GloballyUniqueId fromIValue(const at::IValue&);
+  static GloballyUniqueId fromIValue(const at::IValue& /*ivalue*/);
 
   struct Hash {
     size_t operator()(const GloballyUniqueId& key) const {
@@ -36,7 +42,9 @@ struct TORCH_API GloballyUniqueId final {
 
   static constexpr int kLocalIdBits = 48;
 
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members)
   const worker_id_t createdOn_;
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members)
   const local_id_t localId_;
 };
 
@@ -46,6 +54,7 @@ TORCH_API std::ostream& operator<<(
 
 using RRefId = GloballyUniqueId;
 using ForkId = GloballyUniqueId;
+using ProfilingId = GloballyUniqueId;
 
 struct TORCH_API SerializedPyObj final {
   SerializedPyObj(std::string&& payload, std::vector<at::Tensor>&& tensors)
@@ -58,6 +67,4 @@ struct TORCH_API SerializedPyObj final {
   std::vector<at::Tensor> tensors_;
 };
 
-} // namespace rpc
-} // namespace distributed
-} // namespace torch
+} // namespace torch::distributed::rpc

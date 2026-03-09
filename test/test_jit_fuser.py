@@ -1,22 +1,31 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-from __future__ import unicode_literals
+# Owner(s): ["oncall: jit"]
 
 import unittest
+import os
+import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.testing import FileCheck
+from unittest import skipIf
+
+if __name__ == "__main__":
+    from torch.testing._internal.common_utils import parse_cmd_line_args
+
+    # The value of GRAPH_EXECUTOR depends on command line arguments so make sure they're parsed
+    # before instantiating tests.
+    parse_cmd_line_args()
 
 from torch.testing._internal.common_utils import run_tests, IS_SANDCASTLE, ProfilingMode, GRAPH_EXECUTOR, \
-    enable_profiling_mode_for_profiling_tests
+    enable_profiling_mode_for_profiling_tests, IS_WINDOWS, TemporaryDirectoryName, shell
+from torch.testing._internal.jit_utils import JitTestCase, enable_cpu_fuser, _inline_everything, \
+    RUN_CUDA, RUN_CUDA_HALF, RUN_CUDA_MULTI_GPU, warmup_backward
 from textwrap import dedent
 from itertools import product, permutations
+from torch.testing._internal.common_cuda import with_tf32_off
 
-from test_jit import JitTestCase, enable_cpu_fuser, RUN_CUDA, RUN_CUDA_HALF, RUN_CUDA_MULTI_GPU, \
-    backward_graph, all_backward_graphs, get_lstm_inputs, get_milstm_inputs, \
-    LSTMCellC, LSTMCellF, LSTMCellS, MiLSTMCell, _inline_everything
+from test_jit import backward_graph, all_backward_graphs, get_lstm_inputs, get_milstm_inputs, \
+    LSTMCellC, LSTMCellF, LSTMCellS, MiLSTMCell
 
 if GRAPH_EXECUTOR == ProfilingMode.PROFILING:
     torch._C._jit_set_profiling_executor(True)
@@ -24,31 +33,19 @@ if GRAPH_EXECUTOR == ProfilingMode.PROFILING:
 
 
 def strip_profiling_nodes(nodes):
-    profiling_opcodes = set(['prim::BailoutTemplate', 'prim::BailOut'])
+    profiling_opcodes = {'prim::BailoutTemplate', 'prim::BailOut'}
     return [n for n in nodes if n.kind() not in profiling_opcodes]
-
-
-def warmup_backward(f, *args):
-    profiling_count = 2
-    results = []
-    for i in range(profiling_count):
-        if len(args) > 0:
-            r = torch.autograd.grad(f, *args)
-            results.append(r)
-        else:
-            f.backward(retain_graph=True)
-
-    return results
 
 
 def warmup_forward(f, *args):
     profiling_count = 2
-    for i in range(profiling_count):
+    for _ in range(profiling_count):
         results = f(*args)
 
     return results
 
 
+@skipIf(GRAPH_EXECUTOR == ProfilingMode.LEGACY, "skip due to SIGIOT failures, #67646")
 class TestFuser(JitTestCase):
     def assertAllFused(self, graph, except_for=()):
 
@@ -60,7 +57,7 @@ class TestFuser(JitTestCase):
         allowed_nodes = {'prim::Constant', 'prim::FusionGroup', 'prim::BailoutTemplate',
                          'prim::BailOut', 'prim::TupleConstruct'} | set(except_for)
         self.assertTrue(all(node.kind() in allowed_nodes for node in graph.nodes()),
-                        'got {}'.format(graph))
+                        f'got {graph}')
         self.assertTrue([node.kind() for node in graph.nodes()].count('prim::FusionGroup') == 1)
 
     def _test_fused_abs(self, device='cpu'):
@@ -76,6 +73,21 @@ class TestFuser(JitTestCase):
     def test_abs_cpu(self):
         self._test_fused_abs()
 
+    @unittest.skipIf(not IS_WINDOWS, "This is meant to be Windows-specific")
+    @unittest.skipIf(IS_SANDCASTLE, "NYI: fuser CPU support for Sandcastle")
+    @enable_cpu_fuser
+    def test_abs_cpu_unicode_temp_dir(self):
+        with TemporaryDirectoryName(suffix='\u4e2d\u6587') as dname:
+            shell_env = os.environ.copy()
+            shell_env['TMP'] = dname
+            cmd = [sys.executable, os.path.basename(__file__), type(self).__name__ + '.test_abs_cpu']
+            legacy_jit_flag = '--jit-executor=legacy'
+            for v in sys.argv:
+                if v == legacy_jit_flag:
+                    cmd.append(legacy_jit_flag)
+            return_code = shell(cmd, cwd=os.path.dirname(__file__), env=shell_env)
+            self.assertEqual(return_code, 0)
+
     @unittest.skipIf(not RUN_CUDA, "requires CUDA")
     def test_abs_cuda(self):
         self._test_fused_abs(device="cuda")
@@ -89,7 +101,7 @@ class TestFuser(JitTestCase):
         sin = torch.zeros(0, device="cuda")
         cos = torch.zeros(0, device="cuda")
         inputs = [sin, cos]
-        ge = self.checkScript(decode, inputs)
+        self.checkScript(decode, inputs)
 
     @unittest.skipIf(not RUN_CUDA, "fuser requires CUDA")
     def test_arg_configurations_smoke_cuda(self):
@@ -118,6 +130,16 @@ class TestFuser(JitTestCase):
         ]
         ge = self.checkTrace(scaleshift, inputs)
         self.assertAllFused(ge.graph_for(*inputs))
+
+    @unittest.skipIf(not RUN_CUDA, "fuser requires CUDA")
+    @unittest.skipIf(GRAPH_EXECUTOR != ProfilingMode.LEGACY, "no bfloat support with profiling on")
+    def test_cuda_bfloat16(self):
+        def foo(x, y):
+            return (x + y).relu()
+        m = torch.jit.script(foo)
+        x = torch.randn(65536).cuda().bfloat16()
+        y = torch.randn_like(x)
+        self.assertAllFused(m.graph_for(x, y))
 
     @unittest.skipIf(not RUN_CUDA, "fuser requires CUDA")
     @unittest.skipIf(not RUN_CUDA_HALF, "no half support")
@@ -290,6 +312,24 @@ class TestFuser(JitTestCase):
 
         ge = self.checkScript(fn, inputs)
         self.assertAllFused(ge.graph_for(*inputs))
+
+    @unittest.skipIf(not RUN_CUDA, "fuser requires CUDA")
+    def test_minmax(self):
+        def tmax(a, b):
+            return torch.max(2 * a, b)
+
+        def tmin(a, b):
+            return torch.min(2 * a, b)
+
+        a = torch.randn(4, 4, dtype=torch.float, device="cuda")
+        b = torch.randn(4, 4, dtype=torch.float, device="cuda")
+        nan = torch.tensor(float('nan'), dtype=torch.float, device="cuda")
+
+        for f, inputs in product(
+                (tmax, tmin),
+                ([a, b], [a, nan], [b, nan])):
+            s = self.checkScript(f, inputs)
+            self.assertAllFused(s.graph_for(*inputs))
 
     @unittest.skipIf(not RUN_CUDA, "fuser requires CUDA")
     def test_clamp(self):
@@ -473,12 +513,12 @@ class TestFuser(JitTestCase):
 
     @unittest.skipIf(not RUN_CUDA, "fuser requires CUDA")
     @unittest.skipIf(GRAPH_EXECUTOR != ProfilingMode.LEGACY, "broken with profiling on")
-    @torch.jit._disable_emit_hooks_decorator
+    @torch._jit_internal._disable_emit_hooks_decorator
     @_inline_everything
     def test_fuse_decompose_normalization(self):
         class ResLike(torch.jit.ScriptModule):
             def __init__(self, norm_module):
-                super(ResLike, self).__init__()
+                super().__init__()
                 self.nm = norm_module
 
             @torch.jit.script_method
@@ -538,8 +578,7 @@ class TestFuser(JitTestCase):
 
     @unittest.skipIf(not RUN_CUDA, "fuser requires CUDA")
     def test_scalar_arg_cuda(self):
-        def fn_test_scalar_arg(x, p):
-            # type: (Tensor, float) -> Tensor
+        def fn_test_scalar_arg(x: torch.Tensor, p: float) -> torch.Tensor:
             return p * (x * x + x)
 
         x = torch.randn(4, 4, dtype=torch.float, device='cuda')
@@ -551,12 +590,11 @@ class TestFuser(JitTestCase):
 
         # use another function otherwise we will bailout
         # and won't be able to do fused checks
-        def fn_test_scalar_arg_requires_grad(x, p):
-            # type: (Tensor, float) -> Tensor
+        def fn_test_scalar_arg_requires_grad(x: torch.Tensor, p: float) -> torch.Tensor:
             return p * (x * x + x)
 
         scripted = torch.jit.script(fn_test_scalar_arg_requires_grad)
-        out = scripted(x, p)
+        scripted(x, p)
         self.assertAllFused(scripted.graph_for(x, p), except_for=("aten::size", "prim::BroadcastSizes",
                                                                   "aten::_size_if_not_equal"))
 
@@ -709,6 +747,9 @@ class TestFuser(JitTestCase):
                                                   "aten::_grad_sum_to_size"))
 
     @unittest.skipIf(not RUN_CUDA, "fuser requires CUDA")
+    # By default, on Ampere or later GPUs, LSTM computes float tensors at TF32 precision.
+    # We want float tensors to be computed at full precision in order to use the default precision
+    @with_tf32_off
     def test_lstm_concat_cuda(self):
         inputs = get_lstm_inputs('cuda')
         ge = self.checkTrace(LSTMCellC, inputs)
@@ -739,6 +780,9 @@ class TestFuser(JitTestCase):
 
     # TODO: Fuser doesn't work at all when inputs require grad. Fix that
     @unittest.skipIf(not RUN_CUDA, "fuser requires CUDA")
+    # By default, on Ampere or later GPUs, LSTM computes float tensors at TF32 precision.
+    # We want float tensors to be computed at full precision in order to use the default precision
+    @with_tf32_off
     def test_lstm_traced_cuda(self):
         inputs = get_lstm_inputs('cuda')
         ge = self.checkTrace(LSTMCellF, inputs)
@@ -759,10 +803,10 @@ class TestFuser(JitTestCase):
             FileCheck.check("FusionGroup").run(str(graph))
         except RuntimeError as e:
             if 'Failed to compile' in e.args[0]:
-                warnings.warn('CPU fuser test has failed! This is not a hard failure, '
+                warnings.warn('CPU fuser test has failed! This is not a hard failure, '  # noqa: F821
                               'because the kernels sometimes trigger bugs in compilers '
                               '(most notably GCC 7.2).')
-                raise unittest.SkipTest('Failed to compile')
+                raise unittest.SkipTest('Failed to compile') from e
             else:
                 raise
 
@@ -784,8 +828,8 @@ class TestFuser(JitTestCase):
         class M(torch.jit.ScriptModule):
             __constants__ = ['d']
 
-            def __init__(self):
-                super(M, self).__init__()
+            def __init__(self) -> None:
+                super().__init__()
                 self.d = torch.device('cuda')
 
             @torch.jit.script_method
@@ -943,7 +987,8 @@ class TestFuser(JitTestCase):
             # in order for Python 2
             for g in all_backward_graphs(module):
                 if str(g) not in old_plans:
-                    assert backward is None
+                    if backward is not None:
+                        raise AssertionError("backward should be None")
                     backward = g
                     old_plans.add(str(backward))
             num_grads = 1 if i > 0 else 0
@@ -951,4 +996,5 @@ class TestFuser(JitTestCase):
 
 
 if __name__ == '__main__':
-    run_tests()
+    if sys.version_info < (3, 14):
+        run_tests()

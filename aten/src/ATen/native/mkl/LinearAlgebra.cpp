@@ -1,101 +1,157 @@
-#include <ATen/ATen.h>
-#include <ATen/NativeFunctions.h>
+#define TORCH_ASSERT_NO_OPERATORS
+#include <ATen/native/mkl/LinearAlgebra.h>
 #include <ATen/Config.h>
 
+C10_DIAGNOSTIC_PUSH_AND_IGNORED_IF_DEFINED("-Wunused-parameter")
 #if !AT_MKL_ENABLED()
 
-namespace at { namespace native {
+namespace at::native {
 
-Tensor& _baddbmm_mkl_(Tensor& self, const Tensor& batch1, const Tensor& batch2, Scalar beta, Scalar alpha) {
-  AT_ERROR("bmm: ATen not compiled with MKL support");
+void mkl_gemm_batched(
+    const TransposeType trans_A, const TransposeType trans_B,
+    const MKL_INT batch_size, const MKL_INT M, const MKL_INT N, const MKL_INT K, const float alpha,
+    const float** A, const MKL_INT lda, const float** B, const MKL_INT ldb, const float beta,
+    float** C, const MKL_INT ldc) {
+  TORCH_INTERNAL_ASSERT(false, "mkl_gemm_batched: ATen not compiled with MKL support");
 }
 
-}}
+void mkl_gemm_batched(
+    const TransposeType trans_A, const TransposeType trans_B,
+    const MKL_INT batch_size, const MKL_INT M, const MKL_INT N, const MKL_INT K, const double alpha,
+    const double** A, const MKL_INT lda, const double** B, const MKL_INT ldb, const double beta,
+    double** C, const MKL_INT ldc) {
+  TORCH_INTERNAL_ASSERT(false, "mkl_gemm_batched: ATen not compiled with MKL support");
+}
+
+void mkl_gemm_batched(
+    const TransposeType trans_A, const TransposeType trans_B,
+    const MKL_INT batch_size, const MKL_INT M, const MKL_INT N, const MKL_INT K, const c10::complex<float> alpha,
+    const c10::complex<float>** A, const MKL_INT lda, const c10::complex<float>** B, const MKL_INT ldb,
+    const c10::complex<float> beta, c10::complex<float>** C, const MKL_INT ldc) {
+  TORCH_INTERNAL_ASSERT(false, "mkl_gemm_batched: ATen not compiled with MKL support");
+}
+
+void mkl_gemm_batched(
+    const TransposeType trans_A, const TransposeType trans_B,
+    const MKL_INT batch_size, const MKL_INT M, const MKL_INT N, const MKL_INT K, const c10::complex<double> alpha,
+    const c10::complex<double>** A, const MKL_INT lda, const c10::complex<double>** B, const MKL_INT ldb,
+    const c10::complex<double> beta, c10::complex<double>** C, const MKL_INT ldc) {
+  TORCH_INTERNAL_ASSERT(false, "mkl_gemm_batched: ATen not compiled with MKL support");
+}
+
+void mkl_gemm_bf16bf16f32(
+    TransposeType trans_A, TransposeType trans_B,
+    MKL_INT M, MKL_INT N, MKL_INT K, const float alpha,
+    const c10::BFloat16* A, MKL_INT lda, const c10::BFloat16* B, MKL_INT ldb,
+    const float beta, float* C, MKL_INT ldc) {
+  TORCH_INTERNAL_ASSERT(false, "mkl_gemm_bf16bf16f32: ATen not compiled with MKL support");
+}
+
+void mkl_gemm_f16f16f32(
+    TransposeType trans_A, TransposeType trans_B,
+    int M, int N, int K, const float alpha,
+    const c10::Half* A, int lda, const c10::Half* B, int ldb,
+    const float beta, float* C, int ldc) {
+  TORCH_INTERNAL_ASSERT(false, "mkl_gemm_f16f16f32: ATen not compiled with MKL support");
+}
+
+}
 
 #else // AT_MKL_ENABLED
 
-#include <ATen/ATen.h>
-#include <ATen/Config.h>
-#include <ATen/Dispatch.h>
-#include <ATen/Utils.h>
-#include <ATen/NativeFunctions.h>
-
-#include <algorithm>
-#include <vector>
-#include <numeric>
-#include <cmath>
-
 #include <mkl.h>
-#include <ATen/mkl/Exceptions.h>
-#include <ATen/mkl/Descriptors.h>
-#include <ATen/mkl/Limits.h>
+#include <c10/util/irange.h>
 
-namespace at { namespace native {
+namespace at::native {
 
-static inline void gemm_batched(const CBLAS_TRANSPOSE trans_A, const CBLAS_TRANSPOSE trans_B,
-  const int batch_size, const int M, const int N, const int K, const float alpha,
-  const float** A, const int lda, const float** B, const int ldb, const float beta,
-  float** C, const int ldc) {
-
-  cblas_sgemm_batch(CblasRowMajor, &trans_A, &trans_B, &M, &N, &K, &alpha,
-    A, &lda, B, &ldb, &beta, C, &ldc, 1, &batch_size);
-}
-
-static inline void gemm_batched(const CBLAS_TRANSPOSE trans_A, const CBLAS_TRANSPOSE trans_B,
-  const int batch_size, const int M, const int N, const int K, const double alpha,
-  const double** A, const int lda, const double** B, const int ldb, const double beta,
-  double** C, const int ldc) {
-
-  cblas_dgemm_batch(CblasRowMajor, &trans_A, &trans_B, &M, &N, &K, &alpha,
-    A, &lda, B, &ldb, &beta, C, &ldc, 1, &batch_size);
-}
-
-template <typename scalar_t>
-static inline void baddbmm_mkl_template(const Tensor& res, const Tensor& mat1, const Tensor& mat2, Scalar beta_, Scalar alpha_) {
-  auto is_transposed = [&](const TensorAccessor<scalar_t, 2>& t) {
-    return t.stride(0) == 1 && t.stride(1) >= t.size(0);
-  };
-
-  auto mat1_acc = mat1.accessor<scalar_t, 3>();
-  auto mat2_acc = mat2.accessor<scalar_t, 3>();
-  auto res_acc = res.accessor<scalar_t, 3>();
-
-  const CBLAS_TRANSPOSE trans_A = is_transposed(mat1_acc[0]) ? CblasTrans : CblasNoTrans;
-  const CBLAS_TRANSPOSE trans_B = is_transposed(mat2_acc[0]) ? CblasTrans : CblasNoTrans;
-
-  const int batch_size = mat1_acc.size(0);
-  const int M = mat1_acc.size(1);
-  const int N = mat2_acc.size(2);
-  const int K = mat1_acc.size(2);
-  scalar_t alpha = alpha_.to<scalar_t>();
-  scalar_t beta = beta_.to<scalar_t>();
-
-  const int lda = is_transposed(mat1_acc[0]) ? mat1_acc[0].stride(1) : mat1_acc[0].stride(0);
-  const int ldb = is_transposed(mat2_acc[0]) ? mat2_acc[0].stride(1) : mat2_acc[0].stride(0);
-  const int ldc = res[0].stride(0);
-
-  std::vector<const scalar_t*> A(batch_size);
-  std::vector<const scalar_t*> B(batch_size);
-  std::vector<scalar_t*> C(batch_size);
-
-  for (int64_t batch = 0; batch < batch_size; batch++) {
-    A[batch] = mat1_acc[batch].data();
-    B[batch] = mat2_acc[batch].data();
-    C[batch] = res_acc[batch].data();
+static CBLAS_TRANSPOSE to_cblas(TransposeType x) {
+  switch (x) {
+    case TransposeType::NoTranspose: return CblasNoTrans;
+    case TransposeType::Transpose: return CblasTrans;
+    case TransposeType::ConjTranspose: return CblasConjTrans;
   }
-
-  gemm_batched(trans_A, trans_B, batch_size, M, N, K, alpha, A.data(), lda, B.data(), ldb, beta, C.data(), ldc);
+  TORCH_INTERNAL_ASSERT(false, "Unknown TransposeType");
 }
 
-Tensor& _baddbmm_mkl_(Tensor& self, const Tensor& batch1, const Tensor& batch2, Scalar beta, Scalar alpha) {
-  // checks are done in native/LinearAlgebra.cpp
-  AT_DISPATCH_FLOATING_TYPES(self.scalar_type(), "baddbmm__mkl", [&] {
-      baddbmm_mkl_template<scalar_t>(self, batch1, batch2, beta, alpha);
-    });
-
-  return self;
+void mkl_gemm_batched(
+    const TransposeType trans_A, const TransposeType trans_B,
+    const MKL_INT batch_size, const MKL_INT M, const MKL_INT N, const MKL_INT K, const float alpha,
+    const float** A, const MKL_INT lda, const float** B, const MKL_INT ldb, const float beta,
+    float** C, const MKL_INT ldc) {
+  auto transa_cblas = to_cblas(trans_A);
+  auto transb_cblas = to_cblas(trans_B);
+  cblas_sgemm_batch(CblasColMajor, &transa_cblas, &transb_cblas, &M, &N, &K, &alpha,
+                    A, &lda, B, &ldb, &beta, C, &ldc, 1, &batch_size);
 }
 
-}} // namespace at::native
+void mkl_gemm_batched(
+    const TransposeType trans_A, const TransposeType trans_B,
+    const MKL_INT batch_size, const MKL_INT M, const MKL_INT N, const MKL_INT K, const double alpha,
+    const double** A, const MKL_INT lda, const double** B, const MKL_INT ldb, const double beta,
+    double** C, const MKL_INT ldc) {
+  auto transa_cblas = to_cblas(trans_A);
+  auto transb_cblas = to_cblas(trans_B);
+  cblas_dgemm_batch(CblasColMajor, &transa_cblas, &transb_cblas, &M, &N, &K, &alpha,
+                    A, &lda, B, &ldb, &beta, C, &ldc, 1, &batch_size);
+}
+
+void mkl_gemm_batched(
+    const TransposeType trans_A, const TransposeType trans_B,
+    const MKL_INT batch_size, const MKL_INT M, const MKL_INT N, const MKL_INT K, const c10::complex<float> alpha,
+    const c10::complex<float>** A, const MKL_INT lda, const c10::complex<float>** B, const MKL_INT ldb,
+    const c10::complex<float> beta, c10::complex<float>** C, const MKL_INT ldc) {
+  auto transa_cblas = to_cblas(trans_A);
+  auto transb_cblas = to_cblas(trans_B);
+  cblas_cgemm_batch(CblasColMajor, &transa_cblas, &transb_cblas, &M, &N, &K,
+                    reinterpret_cast<const void*>(&alpha),
+                    reinterpret_cast<const void**>(A), &lda, reinterpret_cast<const void**>(B), &ldb,
+                    reinterpret_cast<const void*>(&beta), reinterpret_cast<void**>(C), &ldc, 1, &batch_size);
+}
+
+void mkl_gemm_batched(
+    const TransposeType trans_A, const TransposeType trans_B,
+    const MKL_INT batch_size, const MKL_INT M, const MKL_INT N, const MKL_INT K, const c10::complex<double> alpha,
+    const c10::complex<double>** A, const MKL_INT lda, const c10::complex<double>** B, const MKL_INT ldb,
+    const c10::complex<double> beta, c10::complex<double>** C, const MKL_INT ldc) {
+  auto transa_cblas = to_cblas(trans_A);
+  auto transb_cblas = to_cblas(trans_B);
+  cblas_zgemm_batch(CblasColMajor, &transa_cblas, &transb_cblas, &M, &N, &K,
+                    reinterpret_cast<const void*>(&alpha),
+                    reinterpret_cast<const void**>(A), &lda, reinterpret_cast<const void**>(B), &ldb,
+                    reinterpret_cast<const void*>(&beta), reinterpret_cast<void**>(C), &ldc, 1, &batch_size);
+}
+
+void mkl_gemm_bf16bf16f32(
+    TransposeType trans_A, TransposeType trans_B,
+    MKL_INT M, MKL_INT N, MKL_INT K, const float alpha,
+    const c10::BFloat16* A, MKL_INT lda, const c10::BFloat16* B, MKL_INT ldb,
+    const float beta, float* C, MKL_INT ldc) {
+#ifdef MKL_HAS_SBGEMM
+  auto transa_cblas = to_cblas(trans_A);
+  auto transb_cblas = to_cblas(trans_B);
+  cblas_gemm_bf16bf16f32(CblasColMajor, transa_cblas, transb_cblas, M, N, K, alpha,
+                         (const MKL_BF16*)A, lda, (const MKL_BF16*)B, ldb, beta, C, ldc);
+#else
+  TORCH_INTERNAL_ASSERT(false, "mkl_gemm_bf16bf16f32 requires mkl version > 2021.0");
+#endif
+}
+
+void mkl_gemm_f16f16f32(
+    TransposeType trans_A, TransposeType trans_B,
+    int M, int N, int K, const float alpha,
+    const c10::Half* A, int lda, const c10::Half* B, int ldb,
+    const float beta, float* C, int ldc) {
+#ifdef MKL_HAS_SHGEMM
+  auto transa_cblas = to_cblas(trans_A);
+  auto transb_cblas = to_cblas(trans_B);
+  cblas_gemm_f16f16f32(CblasColMajor, transa_cblas, transb_cblas, M, N, K, alpha,
+                         (const MKL_F16*)A, lda, (const MKL_F16*)B, ldb, beta, C, ldc);
+#else
+  TORCH_INTERNAL_ASSERT(false, "mkl_gemm_f16f16f32 requires mkl version >= 2024.0");
+#endif
+}
+
+} // namespace at::native
 
 #endif
+C10_DIAGNOSTIC_POP()

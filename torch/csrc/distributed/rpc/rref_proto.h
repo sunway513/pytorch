@@ -4,12 +4,9 @@
 #include <torch/csrc/distributed/rpc/rpc_command_base.h>
 #include <torch/csrc/distributed/rpc/types.h>
 #include <torch/csrc/jit/runtime/operator.h>
-#include <torch/csrc/jit/serialization/pickler.h>
 #include <vector>
 
-namespace torch {
-namespace distributed {
-namespace rpc {
+namespace torch::distributed::rpc {
 
 // Temporary solution of RRef operations.
 // TODO: Remove all these messages and use rpc + registered functions instead.
@@ -18,15 +15,12 @@ class TORCH_API RRefMessageBase : public RpcCommandBase {
   RRefMessageBase(const RRefId& rrefId, MessageType type)
       : rrefId_(rrefId), type_(type) {}
 
-  virtual ~RRefMessageBase() override = default;
-
   const RRefId& rrefId();
 
-  virtual Message toMessageImpl() && override;
-  static at::IValue fromMessage(const Message& message, MessageType type);
-
  protected:
+  // NOLINTNEXTLINE(cppcoreguidelines*)
   const RRefId rrefId_;
+  // NOLINTNEXTLINE(cppcoreguidelines*)
   const MessageType type_;
 };
 
@@ -35,16 +29,15 @@ class TORCH_API ForkMessageBase : public RRefMessageBase {
   ForkMessageBase(const RRefId& rrefId, const ForkId& forkId, MessageType type)
       : RRefMessageBase(rrefId, type), forkId_(forkId) {}
 
-  virtual ~ForkMessageBase() override = default;
-
   const ForkId& forkId();
 
-  virtual Message toMessageImpl() && override;
+  c10::intrusive_ptr<Message> toMessageImpl() && override;
   static std::pair<RRefId, ForkId> fromMessage(
       const Message& message,
       MessageType type);
 
  protected:
+  // NOLINTNEXTLINE(cppcoreguidelines*)
   const ForkId forkId_;
 };
 
@@ -59,11 +52,12 @@ class TORCH_API ScriptRRefFetchCall final : public RRefMessageBase {
     return fromWorkerId_;
   }
 
-  Message toMessageImpl() && override;
+  c10::intrusive_ptr<Message> toMessageImpl() && override;
   static std::unique_ptr<ScriptRRefFetchCall> fromMessage(
       const Message& message);
 
  private:
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members)
   const worker_id_t fromWorkerId_;
 };
 
@@ -73,11 +67,12 @@ class TORCH_API PythonRRefFetchCall final : public RRefMessageBase {
       : RRefMessageBase(rrefId, MessageType::PYTHON_RREF_FETCH_CALL),
         fromWorkerId_(fromWorkerId) {}
 
-  Message toMessageImpl() && override;
+  c10::intrusive_ptr<Message> toMessageImpl() && override;
   static std::unique_ptr<PythonRRefFetchCall> fromMessage(
       const Message& message);
 
  private:
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members)
   const worker_id_t fromWorkerId_;
 };
 
@@ -88,10 +83,11 @@ class TORCH_API RRefFetchRet : public RpcCommandBase {
       : values_(std::move(values)), type_(type) {}
 
   const std::vector<at::IValue>& values();
-  Message toMessageImpl() && override;
+  c10::intrusive_ptr<Message> toMessageImpl() && override;
 
  private:
   std::vector<at::IValue> values_;
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members)
   const MessageType type_;
 };
 
@@ -113,7 +109,7 @@ class TORCH_API PythonRRefFetchRet final : public RRefFetchRet {
       const Message& message);
 };
 
-// UserRRef (regardless it's the creator or not) uses this message to notiify
+// UserRRef (regardless it's the creator or not) uses this message to notify
 // OwnerRRef on delete.
 class TORCH_API RRefUserDelete final : public ForkMessageBase {
  public:
@@ -139,10 +135,11 @@ class TORCH_API RRefChildAccept final : public RpcCommandBase {
 
   const ForkId& forkId() const;
 
-  Message toMessageImpl() && override;
+  c10::intrusive_ptr<Message> toMessageImpl() && override;
   static std::unique_ptr<RRefChildAccept> fromMessage(const Message& message);
 
  private:
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members)
   const ForkId forkId_;
 };
 
@@ -157,12 +154,10 @@ class TORCH_API RRefForkRequest final : public ForkMessageBase {
 
 class TORCH_API RRefAck final : public RpcCommandBase {
  public:
-  RRefAck() {}
+  RRefAck() = default;
 
-  Message toMessageImpl() && override;
+  c10::intrusive_ptr<Message> toMessageImpl() && override;
   static std::unique_ptr<RRefAck> fromMessage(const Message& message);
 };
 
-} // namespace rpc
-} // namespace distributed
-} // namespace torch
+} // namespace torch::distributed::rpc

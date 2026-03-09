@@ -1,19 +1,22 @@
 #!/bin/bash
 set -eux -o pipefail
 
-source "/c/w/env"
+source "${BINARY_ENV_FILE:-/c/w/env}"
 
 export CUDA_VERSION="${DESIRED_CUDA/cu/}"
-export VC_YEAR=2017
+export VC_YEAR=2022
 
-if [[ "$CUDA_VERSION" == "92" || "$CUDA_VERSION" == "100" ]]; then
-  export VC_YEAR=2017
-else
-  export VC_YEAR=2019
+if [[ "$DESIRED_CUDA" == 'xpu' ]]; then
+    export VC_YEAR=2022
+    export XPU_VERSION=2025.3
 fi
 
-pushd "$BUILDER_ROOT"
+pushd "$PYTORCH_ROOT/.ci/pytorch/"
 
-./windows/internal/smoke_test.bat
+if [[ "$OS" == "windows-arm64" ]]; then
+    ./windows/arm64/smoke_test.bat
+else
+    ./windows/internal/smoke_test.bat
+fi
 
 popd

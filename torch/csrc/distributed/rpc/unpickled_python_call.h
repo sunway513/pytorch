@@ -4,9 +4,7 @@
 #include <torch/csrc/distributed/rpc/types.h>
 #include <torch/csrc/utils/pybind.h>
 
-namespace torch {
-namespace distributed {
-namespace rpc {
+namespace torch::distributed::rpc {
 
 // This class converts the content in a PythonCall into py::object. This is a
 // helper class to make sure that all arguments deserialization is done before
@@ -19,22 +17,22 @@ class TORCH_API UnpickledPythonCall : public RpcCommandBase {
  public:
   UnpickledPythonCall(
       const SerializedPyObj& serializedPyObj,
-      bool isAsyncFunction);
+      bool isAsyncExecution);
+  ~UnpickledPythonCall() override;
 
   // toMessage() method is not implemented, as objects of this class should
   // never be directly converted into a Message object.
-  Message toMessageImpl() && override;
-  py::object movePythonUdf() &&;
+  c10::intrusive_ptr<Message> toMessageImpl() && override;
+  const py::object& pythonUdf() const;
 
-  inline bool isAsyncFunction() {
-    return isAsyncFunction_;
+  inline bool isAsyncExecution() const {
+    return isAsyncExecution_;
   }
 
  private:
   py::object pythonUdf_;
-  const bool isAsyncFunction_;
+  // NOLINTNEXTLINE(cppcoreguidelines-avoid-const-or-ref-data-members)
+  const bool isAsyncExecution_;
 };
 
-} // namespace rpc
-} // namespace distributed
-} // namespace torch
+} // namespace torch::distributed::rpc

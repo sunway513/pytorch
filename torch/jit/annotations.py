@@ -1,25 +1,74 @@
-import sys
+# mypy: allow-untyped-defs
 import ast
+import builtins
+import dis
+import enum
 import inspect
 import re
-import torch
-from .._jit_internal import List, BroadcastingList1, BroadcastingList2, \
-    BroadcastingList3, Tuple, is_tuple, is_list, Dict, is_dict, Optional, \
-    is_optional, _qualified_name, Any, RRef, is_rref, Future, is_future
-from torch._C import TensorType, TupleType, FloatType, IntType, \
-    ListType, StringType, DictType, BoolType, OptionalType, ClassType, InterfaceType, AnyType, NoneType, \
-    DeviceObjType, RRefType, FutureType
-
+import typing
+import warnings
 from textwrap import dedent
-from torch._six import builtins
-from torch._utils_internal import get_source_lines_and_file
+
+import torch
+from torch._C import (
+    _GeneratorType,
+    AnyType,
+    AwaitType,
+    BoolType,
+    ComplexType,
+    DeviceObjType,
+    DictType,
+    EnumType,
+    FloatType,
+    FutureType,
+    InterfaceType,
+    IntType,
+    ListType,
+    NoneType,
+    NumberType,
+    OptionalType,
+    StreamObjType,
+    StringType,
+    TensorType,
+    TupleType,
+    UnionType,
+)
+from torch._jit_internal import (
+    _Await,
+    _qualified_name,
+    Any,
+    BroadcastingList1,
+    BroadcastingList2,  # pyrefly: ignore [missing-module-attribute]
+    BroadcastingList3,  # pyrefly: ignore [missing-module-attribute]
+    Dict,
+    Future,
+    is_await,
+    is_dict,
+    is_future,
+    is_ignored_fn,
+    is_list,
+    is_optional,
+    is_tuple,
+    is_union,
+    List,
+    Optional,
+    Tuple,
+    Union,
+)
+from torch._sources import get_source_lines_and_file
+
+from ._state import _get_script_class
 
 
-PY35 = sys.version_info >= (3, 5)
+if torch.distributed.rpc.is_available():
+    from torch._C import RRefType
+    from torch._jit_internal import is_rref, RRef
+
+from torch._ops import OpOverloadPacket
 
 
-class Module(object):
-    def __init__(self, name, members):
+class Module:
+    def __init__(self, name, members) -> None:
         self.name = name
         self.members = members
 
@@ -27,24 +76,30 @@ class Module(object):
         try:
             return self.members[name]
         except KeyError:
-            raise RuntimeError("Module {} has no member called {}".format(self.name, name))
+            raise RuntimeError(
+                f"Module {self.name} has no member called {name}"
+            ) from None
 
 
-class EvalEnv(object):
+class EvalEnv:
     env = {
-        'torch': Module('torch', {'Tensor': torch.Tensor}),
-        'Tensor': torch.Tensor,
-        'typing': Module('typing', {'Tuple': Tuple}),
-        'Tuple': Tuple,
-        'List': List,
-        'Dict': Dict,
-        'Optional': Optional,
-        'RRef': RRef,
-        'Future': Future,
+        "torch": Module("torch", {"Tensor": torch.Tensor}),
+        "Tensor": torch.Tensor,
+        "typing": Module("typing", {"Tuple": Tuple}),
+        "Tuple": Tuple,
+        "List": List,
+        "Dict": Dict,
+        "Optional": Optional,
+        "Union": Union,
+        "Future": Future,
+        "Await": _Await,
     }
 
-    def __init__(self, rcb):
+    def __init__(self, rcb) -> None:
         self.rcb = rcb
+        if torch.distributed.rpc.is_available():
+            # pyrefly: ignore [bad-typed-dict-key, unsupported-operation]
+            self.env["RRef"] = RRef
 
     def __getitem__(self, name):
         if name in self.env:
@@ -53,24 +108,25 @@ class EvalEnv(object):
             return self.rcb(name)
         return getattr(builtins, name, None)
 
+
 def get_signature(fn, rcb, loc, is_method):
-    # Python 3.5 adds support for the nice annotation syntax, so try that first.
-    signature = None
-    if PY35:
+    if isinstance(fn, OpOverloadPacket):
+        signature = try_real_annotations(fn.op, loc)
+    else:
         signature = try_real_annotations(fn, loc)
-        if signature is not None and is_method:
-            # If this is a method, then the signaure will include a type for
-            # `self`, but type comments do not contain a `self`. So strip it
-            # away here so everything is consistent (`inspect.ismethod` does
-            # not work here since `fn` is unbound at this point)
-            param_types, return_type = signature
-            param_types = param_types[1:]
-            signature = (param_types, return_type)
+    if signature is not None and is_method:
+        # If this is a method, then the signature will include a type for
+        # `self`, but type comments do not contain a `self`. So strip it
+        # away here so everything is consistent (`inspect.ismethod` does
+        # not work here since `fn` is unbound at this point)
+        param_types, return_type = signature
+        param_types = param_types[1:]
+        signature = (param_types, return_type)
 
     if signature is None:
         type_line, source = None, None
         try:
-            source = dedent(''.join(get_source_lines_and_file(fn)[0]))
+            source = dedent("".join(get_source_lines_and_file(fn)[0]))
             type_line = get_type_line(source)
         except TypeError:
             pass
@@ -89,7 +145,7 @@ def is_function_or_method(the_callable):
 
 
 def is_vararg(the_callable):
-    if not is_function_or_method(the_callable) and hasattr(the_callable, '__call__'):  # noqa: B004
+    if not is_function_or_method(the_callable) and callable(the_callable):  # noqa: B004
         # If `the_callable` is a class, de-sugar the call so we can still get
         # the signature
         the_callable = the_callable.__call__
@@ -101,11 +157,20 @@ def is_vararg(the_callable):
 
 
 def get_param_names(fn, n_args):
-    if not is_function_or_method(fn) and hasattr(fn, '__call__') and is_function_or_method(fn.__call__):  # noqa: B004
+    if isinstance(fn, OpOverloadPacket):
+        fn = fn.op
+
+    if (
+        not is_function_or_method(fn)
+        and callable(fn)
+        and is_function_or_method(fn.__call__)
+    ):  # noqa: B004
         # De-sugar calls to classes
         fn = fn.__call__
 
     if is_function_or_method(fn):
+        if is_ignored_fn(fn):
+            fn = inspect.unwrap(fn)
         return inspect.getfullargspec(fn).args
     else:
         # The `fn` was not a method or function (maybe a class with a __call__
@@ -113,11 +178,11 @@ def get_param_names(fn, n_args):
         return [str(i) for i in range(n_args)]
 
 
-def check_fn(fn, loc):
+def check_fn(fn, loc) -> None:
     # Make sure the function definition is not a class instantiation
     try:
-        source = dedent(''.join(get_source_lines_and_file(fn)[0]))
-    except (TypeError, IOError):
+        source = dedent("".join(get_source_lines_and_file(fn)[0]))
+    except (OSError, TypeError):
         return
     if source is None:
         return
@@ -125,13 +190,28 @@ def check_fn(fn, loc):
     py_ast = ast.parse(source)
     if len(py_ast.body) == 1 and isinstance(py_ast.body[0], ast.ClassDef):
         raise torch.jit.frontend.FrontendError(
-            loc, "Cannot instantiate class '{}' in a script function".format(py_ast.body[0].name))
+            loc,
+            f"Cannot instantiate class '{py_ast.body[0].name}' in a script function",
+        )
     if len(py_ast.body) != 1 or not isinstance(py_ast.body[0], ast.FunctionDef):
-        raise torch.jit.frontend.FrontendError(loc, "Expected a single top-level function")
+        raise torch.jit.frontend.FrontendError(
+            loc, "Expected a single top-level function"
+        )
+
+
+def _eval_no_call(stmt, glob, loc):
+    """Evaluate statement as long as it does not contain any method/function calls."""
+    bytecode = compile(stmt, "", mode="eval")
+    for insn in dis.get_instructions(bytecode):
+        if "CALL" in insn.opname:
+            raise RuntimeError(
+                f"Type annotation should not contain calls, but '{stmt}' does"
+            )
+    return eval(bytecode, glob, loc)  # type: ignore[arg-type] # noqa: P204
 
 
 def parse_type_line(type_line, rcb, loc):
-    """Parses a type annotation specified as a comment.
+    """Parse a type annotation specified as a comment.
 
     Example inputs:
         # type: (Tensor, torch.Tensor) -> Tuple[Tensor]
@@ -140,39 +220,60 @@ def parse_type_line(type_line, rcb, loc):
     arg_ann_str, ret_ann_str = split_type_line(type_line)
 
     try:
-        arg_ann = eval(arg_ann_str, {}, EvalEnv(rcb))  # noqa: P204
+        arg_ann = _eval_no_call(arg_ann_str, {}, EvalEnv(rcb))
     except (NameError, SyntaxError) as e:
-        raise RuntimeError("Failed to parse the argument list of a type annotation: {}".format(str(e)))
+        raise RuntimeError(
+            "Failed to parse the argument list of a type annotation"
+        ) from e
 
     if not isinstance(arg_ann, tuple):
         arg_ann = (arg_ann,)
 
     try:
-        ret_ann = eval(ret_ann_str, {}, EvalEnv(rcb))  # noqa: P204
+        ret_ann = _eval_no_call(ret_ann_str, {}, EvalEnv(rcb))
     except (NameError, SyntaxError) as e:
-        raise RuntimeError("Failed to parse the return type of a type annotation: {}".format(str(e)))
+        raise RuntimeError(
+            "Failed to parse the return type of a type annotation"
+        ) from e
 
     arg_types = [ann_to_type(ann, loc) for ann in arg_ann]
     return arg_types, ann_to_type(ret_ann, loc)
 
 
 def get_type_line(source):
-    """Tries to find the line containing a comment with the type annotation."""
-    type_comment = '# type:'
+    """Try to find the line containing a comment with the type annotation."""
+    type_comment = "# type:"
 
-    lines = source.split('\n')
-    lines = [(line_num, line) for line_num, line in enumerate(lines)]
+    lines = source.split("\n")
+    lines = list(enumerate(lines))
     type_lines = list(filter(lambda line: type_comment in line[1], lines))
-    lines_with_type = list(filter(lambda line: 'type' in line[1], lines))
+    # `type: ignore` comments may be needed in JIT'ed functions for mypy, due
+    # to the hack in torch/_VF.py.
+
+    # An ignore type comment can be of following format:
+    #   1) type: ignore
+    #   2) type: ignore[rule-code]
+    # This ignore statement must be at the end of the line
+
+    # adding an extra backslash before the space, to avoid triggering
+    # one of the checks in .github/workflows/lint.yml
+    type_pattern = re.compile("# type:\\ ignore(\\[[a-zA-Z-]+\\])?$")
+    type_lines = list(filter(lambda line: not type_pattern.search(line[1]), type_lines))
 
     if len(type_lines) == 0:
-        type_pattern = re.compile('#[\t ]*type[\t ]*:')
-        wrong_type_lines = list(filter(lambda line: type_pattern.search(line[1]), lines))
+        # Catch common typo patterns like extra spaces, typo in 'ignore', etc.
+        wrong_type_pattern = re.compile("#[\t ]*type[\t ]*(?!: ignore(\\[.*\\])?$):")
+        wrong_type_lines = list(
+            filter(lambda line: wrong_type_pattern.search(line[1]), lines)
+        )
         if len(wrong_type_lines) > 0:
-            raise RuntimeError("The annotation prefix in line " + str(wrong_type_lines[0][0])
-                               + " is probably invalid.\nIt must be '# type:'"
-                               + "\nSee PEP 484 (https://www.python.org/dev/peps/pep-0484/#suggested-syntax-for-python-2-7-and-straddling-code)" # noqa
-                               + "\nfor examples")
+            raise RuntimeError(
+                "The annotation prefix in line "
+                + str(wrong_type_lines[0][0])
+                + " is probably invalid.\nIt must be '# type:'"
+                + "\nSee PEP 484 (https://www.python.org/dev/peps/pep-0484/#suggested-syntax-for-python-2-7-and-straddling-code)"  # noqa: B950
+                + "\nfor examples"
+            )
         return None
     elif len(type_lines) == 1:
         # Only 1 type line, quit now
@@ -183,17 +284,21 @@ def get_type_line(source):
     return_line = None
     parameter_type_lines = []
     for line_num, line in type_lines:
-        if '# type: (...) -> ' in line:
+        if "# type: (...) -> " in line:
             return_line = (line_num, line)
             break
         elif type_comment in line:
             parameter_type_lines.append(line)
     if return_line is None:
-        raise RuntimeError("Return type line '# type: (...) -> ...' not found on multiline "
-                           "type annotation\n(See PEP 484 https://www.python.org/dev/peps/pep-0484/#suggested-syntax-for-python-2-7-and-straddling-code)")  # noqa
+        raise RuntimeError(
+            "Return type line '# type: (...) -> ...' not found on multiline "
+            "type annotation\nfor type lines:\n"
+            + "\n".join([line[1] for line in type_lines])
+            + "\n(See PEP 484 https://www.python.org/dev/peps/pep-0484/#suggested-syntax-for-python-2-7-and-straddling-code)"
+        )
 
     def get_parameter_type(line):
-        item_type = line[line.find(type_comment) + len(type_comment):]
+        item_type = line[line.find(type_comment) + len(type_comment) :]
         return item_type.strip()
 
     types = map(get_parameter_type, parameter_type_lines)
@@ -203,7 +308,7 @@ def get_type_line(source):
 
 
 def split_type_line(type_line):
-    """Splits the comment with the type annotation into parts for argument and return types.
+    """Split the comment with the type annotation into parts for argument and return types.
 
     For example, for an input of:
         # type: (Tensor, torch.Tensor) -> Tuple[Tensor, Tensor]
@@ -212,62 +317,164 @@ def split_type_line(type_line):
         ("(Tensor, torch.Tensor)", "Tuple[Tensor, Tensor]")
 
     """
-    start_offset = len('# type:')
+    start_offset = len("# type:")
     try:
-        arrow_pos = type_line.index('->')
+        arrow_pos = type_line.index("->")
     except ValueError:
-        raise RuntimeError("Syntax error in type annotation (cound't find `->`)")
-    return type_line[start_offset:arrow_pos].strip(), type_line[arrow_pos + 2:].strip()
+        raise RuntimeError(
+            "Syntax error in type annotation (couldn't find `->`)"
+        ) from None
+    return type_line[start_offset:arrow_pos].strip(), type_line[arrow_pos + 2 :].strip()
 
 
 def try_real_annotations(fn, loc):
-    """Tries to use the Py3.5+ annotation syntax to get the type."""
+    """Try to use the Py3.5+ annotation syntax to get the type."""
     try:
+        # Note: anything annotated as `Optional[T]` will automatically
+        # be returned as `Union[T, None]` per
+        # https://github.com/python/cpython/blob/main/Lib/typing.py#L732
         sig = inspect.signature(fn)
     except ValueError:
         return None
 
-    all_annots = [sig.return_annotation] + [p.annotation for p in sig.parameters.values()]
+    all_annots = [sig.return_annotation] + [
+        p.annotation for p in sig.parameters.values()
+    ]
     if all(ann is sig.empty for ann in all_annots):
         return None
 
-    def as_ann(ann):
-        # sig.empty is really annoying so convert it to None
-        return ann if ann is not sig.empty else None
-
-    arg_types = [ann_to_type(as_ann(p.annotation), loc)
-                 for p in sig.parameters.values()]
-    return_type = ann_to_type(as_ann(sig.return_annotation), loc)
+    arg_types = [ann_to_type(p.annotation, loc) for p in sig.parameters.values()]
+    return_type = ann_to_type(sig.return_annotation, loc)
     return arg_types, return_type
 
 
-def try_ann_to_type(ann, loc):
+# Finds common type for enum values belonging to an Enum class. If not all
+# values have the same type, AnyType is returned.
+def get_enum_value_type(e: type[enum.Enum], loc):
+    enum_values: List[enum.Enum] = list(e)
+    if not enum_values:
+        raise ValueError(f"No enum values defined for: '{e.__class__}'")
+
+    types = {type(v.value) for v in enum_values}
+    ir_types = [try_ann_to_type(t, loc) for t in types]
+
+    # If Enum values are of different types, an exception will be raised here.
+    # Even though Python supports this case, we chose to not implement it to
+    # avoid overcomplicate logic here for a rare use case. Please report a
+    # feature request if you find it necessary.
+    res = torch._C.unify_type_list(ir_types)
+    if not res:
+        return AnyType.get()
+    return res
+
+
+def is_tensor(ann) -> bool:
+    if issubclass(ann, torch.Tensor):
+        return True
+
+    if issubclass(
+        ann,
+        (
+            torch.LongTensor,
+            torch.DoubleTensor,
+            torch.FloatTensor,
+            torch.IntTensor,
+            torch.ShortTensor,
+            torch.HalfTensor,
+            torch.CharTensor,
+            torch.ByteTensor,
+            torch.BoolTensor,
+        ),
+    ):
+        warnings.warn(
+            "TorchScript will treat type annotations of Tensor "
+            "dtype-specific subtypes as if they are normal Tensors. "
+            "dtype constraints are not enforced in compilation either.",
+            stacklevel=2,
+        )
+        return True
+
+    return False
+
+
+def _fake_rcb(inp) -> None:
+    return None
+
+
+def try_ann_to_type(ann, loc, rcb=None):
+    ann_args = typing.get_args(ann)  # always returns a tuple!
+
+    if ann is inspect.Signature.empty:
+        return TensorType.getInferred()
     if ann is None:
-        return TensorType.get()
-    if ann is torch.Tensor:
+        return NoneType.get()
+    if inspect.isclass(ann) and is_tensor(ann):
         return TensorType.get()
     if is_tuple(ann):
-        return TupleType([try_ann_to_type(a, loc) for a in ann.__args__])
+        # Special case for the empty Tuple type annotation `Tuple[()]`
+        if len(ann_args) == 1 and ann_args[0] == ():
+            return TupleType([])
+        return TupleType([try_ann_to_type(a, loc) for a in ann_args])
     if is_list(ann):
-        elem_type = try_ann_to_type(ann.__args__[0], loc)
+        elem_type = try_ann_to_type(ann_args[0], loc)
         if elem_type:
             return ListType(elem_type)
     if is_dict(ann):
-        key = try_ann_to_type(ann.__args__[0], loc)
-        value = try_ann_to_type(ann.__args__[1], loc)
+        key = try_ann_to_type(ann_args[0], loc)
+        value = try_ann_to_type(ann_args[1], loc)
+        # Raise error if key or value is None
+        if key is None:
+            raise ValueError(
+                f"Unknown type annotation: '{ann_args[0]}' at {loc.highlight()}"
+            )
+        if value is None:
+            raise ValueError(
+                f"Unknown type annotation: '{ann_args[1]}' at {loc.highlight()}"
+            )
         return DictType(key, value)
     if is_optional(ann):
-        if issubclass(ann.__args__[1], type(None)):
-            return OptionalType(try_ann_to_type(ann.__args__[0], loc))
+        if issubclass(ann_args[1], type(None)):
+            contained = ann_args[0]
         else:
-            return OptionalType(try_ann_to_type(ann.__args__[1], loc))
-    if is_rref(ann):
-        return RRefType(try_ann_to_type(ann.__args__[0], loc))
+            contained = ann_args[1]
+        valid_type = try_ann_to_type(contained, loc)
+        if not valid_type:
+            raise AssertionError(
+                f"Unsupported annotation {repr(ann)} could not be resolved because "
+                f"{repr(contained)} could not be resolved. At\n{repr(loc)}"
+            )
+        return OptionalType(valid_type)
+    if is_union(ann):
+        # TODO: this is hack to recognize NumberType
+        if set(ann_args) == {int, float, complex}:
+            return NumberType.get()
+        inner: List = []
+        # We need these extra checks because both `None` and invalid
+        # values will return `None`
+        # TODO: Determine if the other cases need to be fixed as well
+        for a in typing.get_args(ann):
+            if a is None:
+                inner.append(NoneType.get())
+            maybe_type = try_ann_to_type(a, loc)
+            if not maybe_type:
+                raise AssertionError(
+                    f"Unsupported annotation {repr(ann)} could not be resolved because "
+                    f"{repr(a)} could not be resolved. At\n{repr(loc)}"
+                )
+            inner.append(maybe_type)
+        return UnionType(inner)  # type: ignore[arg-type]
+    if torch.distributed.rpc.is_available() and is_rref(ann):
+        return RRefType(try_ann_to_type(ann_args[0], loc))
     if is_future(ann):
-        return FutureType(try_ann_to_type(ann.__args__[0], loc))
+        return FutureType(try_ann_to_type(ann_args[0], loc))
+    if is_await(ann):
+        elementType = try_ann_to_type(ann_args[0], loc) if ann_args else AnyType.get()
+        return AwaitType(elementType)
     if ann is float:
         return FloatType.get()
-    if ann is int:
+    if ann is complex:
+        return ComplexType.get()
+    if ann is int or ann is torch.SymInt:
         return IntType.get()
     if ann is str:
         return StringType.get()
@@ -278,59 +485,78 @@ def try_ann_to_type(ann, loc):
     if ann is type(None):
         return NoneType.get()
     if inspect.isclass(ann) and hasattr(ann, "__torch_script_interface__"):
-        return InterfaceType(_qualified_name(ann))
+        return InterfaceType(ann.__torch_script_interface__)
     if ann is torch.device:
         return DeviceObjType.get()
+    if ann is torch.Generator:
+        return _GeneratorType.get()
+    if ann is torch.Stream:
+        return StreamObjType.get()
+    if ann is torch.dtype:
+        return IntType.get()  # dtype not yet bound in as its own type
+    if ann is torch.qscheme:
+        return IntType.get()  # qscheme not yet bound in as its own type
+
+    if inspect.isclass(ann) and issubclass(ann, enum.Enum):
+        if _get_script_class(ann) is None:
+            scripted_class = torch.jit._script._recursive_compile_class(ann, loc)
+            name = scripted_class.qualified_name()
+        else:
+            name = _qualified_name(ann)
+        return EnumType(name, get_enum_value_type(ann, loc), list(ann))
     if inspect.isclass(ann):
-        if hasattr(ann, "__torch_script_class__"):
-            return ClassType(_qualified_name(ann))
-        ignored_builtin_classes = (torch.nn.Module, tuple, list)
-        if torch._jit_internal.can_compile_class(ann) and not issubclass(ann, ignored_builtin_classes):
-            torch.jit._recursive_compile_class(ann, loc)
-            return ClassType(_qualified_name(ann))
+        maybe_script_class = _get_script_class(ann)
+        if maybe_script_class is not None:
+            return maybe_script_class
+        if torch._jit_internal.can_compile_class(ann):
+            return torch.jit._script._recursive_compile_class(ann, loc)
 
     # Maybe resolve a NamedTuple to a Tuple Type
-    def fake_rcb(key):
-        return None
-    return torch._C._resolve_type_from_object(ann, loc, fake_rcb)
+    if rcb is None:
+        rcb = _fake_rcb
+    # pyrefly: ignore [bad-argument-type]
+    return torch._C._resolve_type_from_object(ann, loc, rcb)
 
 
-def ann_to_type(ann, loc):
-    the_type = try_ann_to_type(ann, loc)
+def ann_to_type(ann, loc, rcb=None):
+    the_type = try_ann_to_type(ann, loc, rcb)
     if the_type is not None:
         return the_type
-    raise ValueError("Unknown type annotation: '{}'".format(ann))
+    raise ValueError(f"Unknown type annotation: '{ann}' at {loc.highlight()}")
 
 
 __all__ = [
-    'Any',
-    'List',
-    'BroadcastingList1',
-    'BroadcastingList2',
-    'BroadcastingList3',
-    'Tuple',
-    'is_tuple',
-    'is_list',
-    'Dict',
-    'is_dict',
-    'TensorType',
-    'TupleType',
-    'FloatType',
-    'IntType',
-    'ListType',
-    'StringType',
-    'DictType',
-    'AnyType',
-    'Module',
+    "Any",
+    "List",
+    "BroadcastingList1",
+    "BroadcastingList2",
+    "BroadcastingList3",
+    "Tuple",
+    "is_tuple",
+    "is_list",
+    "Dict",
+    "is_dict",
+    "is_optional",
+    "is_union",
+    "TensorType",
+    "TupleType",
+    "FloatType",
+    "ComplexType",
+    "IntType",
+    "ListType",
+    "StringType",
+    "DictType",
+    "AnyType",
+    "Module",
     # TODO: Consider not exporting these during wildcard import (reserve
     # that for the types; for idiomatic typing code.)
-    'get_signature',
-    'check_fn',
-    'get_param_names',
-    'parse_type_line',
-    'get_type_line',
-    'split_type_line',
-    'try_real_annotations',
-    'try_ann_to_type',
-    'ann_to_type',
+    "get_signature",
+    "check_fn",
+    "get_param_names",
+    "parse_type_line",
+    "get_type_line",
+    "split_type_line",
+    "try_real_annotations",
+    "try_ann_to_type",
+    "ann_to_type",
 ]

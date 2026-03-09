@@ -16,17 +16,17 @@
 #  x2: kc
 #  x3: ks
 #  x4: a
-#  x5: w 
-#  x6: c 
+#  x5: w
+#  x6: c
 #  x7: c_stride
 #
 
 #  Args passed via stack.
 #  TOS
-#  |-----------|
-#  |out ch indx| 0
-#  |params     | 8
-#  |-----------|
+#  |------------|
+#  |out ch index| 0
+#  |params      | 8
+#  |------------|
 
 # void pytorch_q8conv_ukernel_8x8__aarch64_neon(
 #    size_t mr,

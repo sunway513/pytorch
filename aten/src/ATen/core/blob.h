@@ -1,10 +1,6 @@
 #pragma once
 
-#include <cstddef>
-#include <sstream>
 #include <type_traits>
-#include <typeinfo>
-#include <vector>
 
 #include <c10/util/intrusive_ptr.h>
 #include <c10/util/typeid.h>
@@ -21,13 +17,13 @@ class Tensor;
  * properly when the blob is deallocated or re-allocated with a new type. A blob
  * could contain anything, although the most common case is to contain a Tensor.
  */
-class CAFFE2_API Blob final : public c10::intrusive_ptr_target {
+class TORCH_API Blob final : public c10::intrusive_ptr_target {
  public:
   /**
    * Initializes an empty Blob.
    */
-  Blob() noexcept : meta_(), pointer_(nullptr), has_ownership_(false) {}
-  ~Blob() {
+  Blob() noexcept = default;
+  ~Blob() override {
     Reset();
   }
 
@@ -51,14 +47,14 @@ class CAFFE2_API Blob final : public c10::intrusive_ptr_target {
   /**
    * Returns the meta info of the blob.
    */
-  const TypeMeta& meta() const noexcept {
+  const TypeMeta meta() const noexcept {
     return meta_;
   }
 
   /**
    * Returns a printable typename of the blob.
    */
-  c10::string_view TypeName() const noexcept {
+  std::string_view TypeName() const noexcept {
     return meta_.name();
   }
 
@@ -66,16 +62,16 @@ class CAFFE2_API Blob final : public c10::intrusive_ptr_target {
    * @brief Gets the const reference of the stored object. The code checks if
    * the stored object is of the desired type.
    */
-  // TODO(jerryzh): add a Get(DeviceType) function?
+  // TODO(jerryzh): add a Get(c10::DeviceType) function?
   template <class T>
   const T& Get() const {
-    AT_ASSERTM(
+    TORCH_INTERNAL_ASSERT(
         IsType<T>(),
         "wrong type for the Blob instance. Blob contains ",
         meta_.name(),
         " while caller expects ",
         TypeMeta::TypeName<T>());
-    // TODO: after we add Get<Tensor>(DeviceType)
+    // TODO: after we add Get<Tensor>(c10::DeviceType)
     // and changed all the callsites, we can add
     // a static assert here to enforce T != Tensor
     return *static_cast<const T*>(pointer_);
@@ -99,7 +95,7 @@ class CAFFE2_API Blob final : public c10::intrusive_ptr_target {
   template <class T>
   T* GetMutable() {
     static_assert(
-        std::is_default_constructible<T>::value,
+        std::is_default_constructible_v<T>,
         "GetMutable can't be called with non-default-constructible types. "
         "Try using specialized methods");
     if (IsType<T>()) {
@@ -148,14 +144,14 @@ class CAFFE2_API Blob final : public c10::intrusive_ptr_target {
    * call is made or the blob is destructed.
    */
   template <class T>
-  typename std::remove_const<T>::type* ShareExternal(
-      typename std::remove_const<T>::type* allocated) {
+  std::remove_const_t<T>* ShareExternal(
+      std::remove_const_t<T>* allocated) {
     return static_cast<T*>(ShareExternal(
         static_cast<void*>(allocated),
-        TypeMeta::Make<typename std::remove_const<T>::type>()));
+        TypeMeta::Make<std::remove_const_t<T>>()));
   }
 
-  void* ShareExternal(void* allocated, const TypeMeta& meta) {
+  void* ShareExternal(void* allocated, const TypeMeta meta) {
     free_();
     meta_ = meta;
     pointer_ = allocated;
@@ -176,7 +172,7 @@ class CAFFE2_API Blob final : public c10::intrusive_ptr_target {
   /**
    * @brief Swaps the underlying storage of two blobs.
    */
-  void swap(Blob& rhs) {
+  void swap(Blob& rhs)  noexcept {
     using std::swap;
     swap(meta_, rhs.meta_);
     swap(pointer_, rhs.pointer_);
@@ -191,18 +187,18 @@ class CAFFE2_API Blob final : public c10::intrusive_ptr_target {
   }
 
   TypeMeta meta_;
-  void* pointer_;
-  bool has_ownership_;
+  void* pointer_{nullptr};
+  bool has_ownership_{false};
 
   C10_DISABLE_COPY_AND_ASSIGN(Blob);
 };
 
-inline void swap(Blob& lhs, Blob& rhs) {
+inline void swap(Blob& lhs, Blob& rhs)  noexcept {
   lhs.swap(rhs);
 }
 
 inline std::ostream& operator<<(std::ostream& out, const Blob& v) {
-  return out << "Blob[" << v.TypeName() << "]";
+  return out << "Blob[" << v.TypeName() << ']';
 }
 
 } // namespace caffe2

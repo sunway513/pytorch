@@ -1,5 +1,9 @@
+# mypy: allow-untyped-defs
 import torch
-from torch._six import with_metaclass
+from torch._C import _ImperativeEngine as ImperativeEngine
+
+
+__all__ = ["VariableMeta", "Variable"]
 
 
 class VariableMeta(type):
@@ -7,9 +11,5 @@ class VariableMeta(type):
         return isinstance(other, torch.Tensor)
 
 
-class Variable(with_metaclass(VariableMeta, torch._C._LegacyVariableBase)):
-    pass
-
-
-from torch._C import _ImperativeEngine as ImperativeEngine
-Variable._execution_engine = ImperativeEngine()
+class Variable(torch._C._LegacyVariableBase, metaclass=VariableMeta):  # type: ignore[misc]
+    _execution_engine = ImperativeEngine()

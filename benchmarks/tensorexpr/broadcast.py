@@ -1,12 +1,16 @@
-from . import benchmark
 import itertools
+import operator
+
 import numpy as np
+
 import torch
+
+from . import benchmark
 
 
 class BroadcastMulBench(benchmark.Benchmark):
-    def __init__(self, mode, device, case, M, N, K):
-        super().__init__(mode, device)
+    def __init__(self, mode, device, dtype, case, M, N, K):
+        super().__init__(mode, device, dtype)
         self.case = case
         self.M = M
         self.N = N
@@ -14,27 +18,27 @@ class BroadcastMulBench(benchmark.Benchmark):
 
         if case == "row":
             self.d1 = self.rand(
-                [M, N, 1], device=device, requires_grad=self.requires_grad
+                [M, N, 1], device=device, dtype=dtype, requires_grad=self.requires_grad
             )
             self.d2 = self.rand(
-                [M, 1, K], device=device, requires_grad=self.requires_grad
+                [M, 1, K], device=device, dtype=dtype, requires_grad=self.requires_grad
             )
         elif case == "mid":
             self.d1 = self.rand(
-                [M, N, 1], device=device, requires_grad=self.requires_grad
+                [M, N, 1], device=device, dtype=dtype, requires_grad=self.requires_grad
             )
             self.d2 = self.rand(
-                [1, N, K], device=device, requires_grad=self.requires_grad
+                [1, N, K], device=device, dtype=dtype, requires_grad=self.requires_grad
             )
         elif case == "col":
             self.d1 = self.rand(
-                [M, 1, K], device=device, requires_grad=self.requires_grad
+                [M, 1, K], device=device, dtype=dtype, requires_grad=self.requires_grad
             )
             self.d2 = self.rand(
-                [1, N, K], device=device, requires_grad=self.requires_grad
+                [1, N, K], device=device, dtype=dtype, requires_grad=self.requires_grad
             )
         else:
-            raise ValueError("invalid case: %s" % (case))
+            raise ValueError(f"invalid case: {case}")
 
         self.inputs = [self.d1, self.d2]
 
@@ -60,7 +64,7 @@ class BroadcastMulBench(benchmark.Benchmark):
             sol_count = (1) + (1)
             algorithmic_count = 1 + (1 + 1)
 
-        buffer_size = self.M * self.N * self.K * 4
+        buffer_size = self.M * self.N * self.K
         return {
             "sol": buffer_size * sol_count,
             "algorithmic": buffer_size * algorithmic_count,
@@ -68,8 +72,8 @@ class BroadcastMulBench(benchmark.Benchmark):
 
 
 class BroadcastRowBench(BroadcastMulBench):
-    def __init__(self, mode, device, M, N, K):
-        super(BroadcastRowBench, self).__init__(mode, device, "row", M, N, K)
+    def __init__(self, mode, device, dtype, M, N, K):
+        super().__init__(mode, device, dtype, "row", M, N, K)
 
     @staticmethod
     def module():
@@ -77,8 +81,8 @@ class BroadcastRowBench(BroadcastMulBench):
 
 
 class BroadcastMidBench(BroadcastMulBench):
-    def __init__(self, mode, device, M, N, K):
-        super(BroadcastMidBench, self).__init__(mode, device, "mid", M, N, K)
+    def __init__(self, mode, device, dtype, M, N, K):
+        super().__init__(mode, device, dtype, "mid", M, N, K)
 
     @staticmethod
     def module():
@@ -86,8 +90,8 @@ class BroadcastMidBench(BroadcastMulBench):
 
 
 class BroadcastColBench(BroadcastMulBench):
-    def __init__(self, mode, device, M, N, K):
-        super(BroadcastColBench, self).__init__(mode, device, "col", M, N, K)
+    def __init__(self, mode, device, dtype, M, N, K):
+        super().__init__(mode, device, dtype, "col", M, N, K)
 
     @staticmethod
     def module():
@@ -95,17 +99,21 @@ class BroadcastColBench(BroadcastMulBench):
 
 
 class BroadcastThreeArgs(benchmark.Benchmark):
-    def __init__(self, mode, device, M, N, K, L):
-        super().__init__(mode, device)
+    def __init__(self, mode, device, dtype, M, N, K, L):
+        super().__init__(mode, device, dtype)
         self.M = M
         self.N = N
         self.K = K
         self.L = L
 
-        self.d1 = self.rand([M, N], device=device, requires_grad=self.requires_grad)
-        self.d2 = self.rand([K, M, 1], device=device, requires_grad=self.requires_grad)
+        self.d1 = self.rand(
+            [M, N], device=device, dtype=dtype, requires_grad=self.requires_grad
+        )
+        self.d2 = self.rand(
+            [K, M, 1], device=device, dtype=dtype, requires_grad=self.requires_grad
+        )
         self.d3 = self.rand(
-            [L, K, 1, 1], device=device, requires_grad=self.requires_grad
+            [L, K, 1, 1], device=device, dtype=dtype, requires_grad=self.requires_grad
         )
 
         self.inputs = [self.d1, self.d2, self.d3]
@@ -148,6 +156,7 @@ class BroadcastThreeArgs(benchmark.Benchmark):
 # benchmark.register_benchmark_class(BroadcastColBench)
 # benchmark.register_benchmark_class(BroadcastThreeArgs)
 
+
 # TODO: merge this with elementwise bench
 # A template class for elementwise operations.
 # A derived class will override the class instance to customize its behavior.
@@ -160,24 +169,36 @@ class BroadcastBench(benchmark.Benchmark):
     unary_op_np_func = None
     split_input = True
 
-    def __init__(self, mode, device, M, N, K):
-        super().__init__(mode, device)
+    def __init__(self, mode, device, dtype, M, N, K):
+        super().__init__(mode, device, dtype)
         self.M = M
         self.N = N
         self.K = K
-        self.d1 = self.rand([M, N], device=device, requires_grad=self.requires_grad)
-        self.d2 = self.rand([K, 1, N], device=device, requires_grad=self.requires_grad)
-        self.d3 = self.rand([M, N], device=device, requires_grad=self.requires_grad)
-        self.d4 = self.rand([K, M, 1], device=device, requires_grad=self.requires_grad)
+        self.d1 = self.rand(
+            [M, N], device=device, dtype=dtype, requires_grad=self.requires_grad
+        )
+        self.d2 = self.rand(
+            [K, 1, N], device=device, dtype=dtype, requires_grad=self.requires_grad
+        )
+        self.d3 = self.rand(
+            [M, N], device=device, dtype=dtype, requires_grad=self.requires_grad
+        )
+        self.d4 = self.rand(
+            [K, M, 1], device=device, dtype=dtype, requires_grad=self.requires_grad
+        )
         self.inputs = [self.d1, self.d2, self.d3, self.d4]
 
     def _eval(self, d1, d2, d3, d4, binary_op, unary_op):
         if not binary_op:
+
             def binary_op(x, y):
                 return x + y
+
         if not unary_op:
+
             def unary_op(x):
                 return x
+
         if self.split_input:
             d1 = unary_op(d1)
             d2 = unary_op(d2)
@@ -243,24 +264,24 @@ class BroadcastBench(benchmark.Benchmark):
 
 def register_broadcast_ops():
     binary_op_list = [
-        ["mul", lambda a, b: a * b],
-        ["add", lambda a, b: a + b],
-        ["sub", lambda a, b: a - b],
+        ["mul", operator.mul],
+        ["add", operator.add],
+        ["sub", operator.sub],
         ["div", lambda a, b: a / (b + 1e-4)],
         [
             "pow",
-            lambda a, b: torch.pow(a, b),
-            lambda a, b: np.power(a, b),
+            torch.pow,
+            np.power,
         ],  # no fuson triggered
-        ["max", lambda a, b: torch.max(a, b), lambda a, b: np.maximum(a, b)],
-        ["min", lambda a, b: torch.min(a, b), lambda a, b: np.minimum(a, b)],
+        ["max", torch.max, np.maximum],
+        ["min", torch.min, np.minimum],
     ]
 
     unary_op_list = [
-        ["erf", lambda x: torch.erf(x), lambda x: np.erf(x)],
-        ["exp", lambda x: torch.exp(x), lambda x: np.exp(x)],
-        ["sin", lambda x: torch.sin(x), lambda x: np.sin(x)],
-        ["cos", lambda x: torch.cos(x), lambda x: np.cos(x)],
+        ["erf", torch.erf, np.erf],
+        ["exp", torch.exp, np.exp],
+        ["sin", torch.sin, np.sin],
+        ["cos", torch.cos, np.cos],
     ]
 
     for split_input, binary_op in itertools.product([True, False], binary_op_list):

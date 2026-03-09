@@ -1,12 +1,12 @@
 #include <torch/csrc/jit/passes/lower_graph.h>
+
 #include <torch/csrc/jit/api/object.h>
 #include <torch/csrc/jit/frontend/error_report.h>
 #include <torch/csrc/jit/passes/inliner.h>
 #include <torch/custom_class.h>
 #include <unordered_map>
 
-namespace torch {
-namespace jit {
+namespace torch::jit {
 
 struct Slot {
   c10::intrusive_ptr<c10::ivalue::Object> obj;
@@ -20,7 +20,7 @@ struct Slot {
 // parameters/attributes with extra_ivalue input Slots that hold what value to
 // pass into the graph. Used for ONNX export to remove first-class modules
 // so it can deal purely with parameters and inputs
-std::pair<std::shared_ptr<Graph>, std::vector<Slot>> lower_graph(
+static std::pair<std::shared_ptr<Graph>, std::vector<Slot>> lower_graph(
     const ModulePtr& self,
     Graph& g_,
     size_t self_offset = 0) {
@@ -34,7 +34,7 @@ std::pair<std::shared_ptr<Graph>, std::vector<Slot>> lower_graph(
     std::size_t operator()(const Slot& slot) const {
       auto obj_hash = std::hash<c10::ivalue::Object*>{}(slot.obj.get());
       auto offset_hash = std::hash<size_t>{}(slot.offset);
-      return torch::hash_combine(obj_hash, offset_hash);
+      return c10::hash_combine(obj_hash, offset_hash);
     }
   };
   std::unordered_map<Slot, size_t, SlotHash> slot_to_offset;
@@ -62,7 +62,7 @@ std::pair<std::shared_ptr<Graph>, std::vector<Slot>> lower_graph(
   for (Use use : self_value->uses()) {
     to_scan.emplace_back(ToScan{self, use.user, use.offset});
   }
-  while (to_scan.size() > 0) {
+  while (!to_scan.empty()) {
     auto e = to_scan.back();
     to_scan.pop_back();
 
@@ -103,7 +103,7 @@ std::pair<std::shared_ptr<Graph>, std::vector<Slot>> lower_graph(
     e.n->destroy();
   }
 
-  while (to_clean.size() > 0) {
+  while (!to_clean.empty()) {
     Node* n = to_clean.back();
     AT_ASSERT(!n->hasUses());
     n->destroy();
@@ -136,7 +136,7 @@ static std::vector<IValue> loadTensors(const std::vector<Slot>& slots) {
                getCustomClass(
                    "__torch__.torch.classes.quantized.LinearPackedParamsBase")),
           "Unknown type ",
-          type->python_str(),
+          type->repr_str(),
           " encountered in graph lowering. This type is not supported in ONNX export.");
       result.emplace_back(
           script::Object(obj.toObject()).run_method("__getstate__"));
@@ -152,5 +152,4 @@ std::pair<std::shared_ptr<Graph>, std::vector<IValue>> LowerGraph(
   return std::make_pair(result.first, loadTensors(result.second));
 }
 
-} // namespace jit
-} // namespace torch
+} // namespace torch::jit

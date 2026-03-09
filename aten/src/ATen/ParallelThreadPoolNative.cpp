@@ -1,4 +1,5 @@
-#if AT_PARALLEL_OPENMP || AT_PARALLEL_NATIVE || AT_PARALLEL_NATIVE_TBB
+#include <ATen/Config.h>
+#if AT_PARALLEL_OPENMP || AT_PARALLEL_NATIVE
 #include <ATen/Parallel.h>
 #include <ATen/PTThreadPool.h>
 #include <ATen/ThreadLocalState.h>
@@ -44,7 +45,7 @@ std::shared_ptr<TaskThreadPoolBase> create_c10_threadpool(
 
 } // namespace
 
-C10_REGISTER_CREATOR(ThreadPoolRegistry, C10, create_c10_threadpool);
+C10_REGISTER_CREATOR(ThreadPoolRegistry, C10, create_c10_threadpool)
 
 void set_num_interop_threads(int nthreads) {
   TORCH_CHECK(nthreads > 0, "Expected positive number of threads");
@@ -55,7 +56,8 @@ void set_num_interop_threads(int nthreads) {
       "has started or set_num_interop_threads called");
 }
 
-int get_num_interop_threads() {
+size_t get_num_interop_threads() {
+  at::internal::lazy_init_num_threads();
   int nthreads = num_interop_threads.load();
   if (nthreads > 0) {
     return nthreads;
@@ -78,9 +80,10 @@ void launch_no_thread_state(std::function<void()> fn) {
 } // namespace internal
 
 void launch(std::function<void()> func) {
+  // NOLINTNEXTLINE(modernize-avoid-bind)
   internal::launch_no_thread_state(std::bind([](
-    std::function<void()> f, ThreadLocalState thread_locals) {
-      ThreadLocalStateGuard guard(std::move(thread_locals));
+    const std::function<void()>& f, const ThreadLocalState& thread_locals) {
+      ThreadLocalStateGuard guard(thread_locals);
       f();
     },
     std::move(func),

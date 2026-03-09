@@ -1,9 +1,13 @@
+# mypy: ignore-errors
+
 from collections import defaultdict
+from collections.abc import Iterable
 import numpy as np
 import torch
 
 import hypothesis
 from functools import reduce
+from importlib.metadata import version
 from hypothesis import assume
 from hypothesis import settings
 from hypothesis import strategies as st
@@ -33,7 +37,7 @@ _ENFORCED_ZERO_POINT = defaultdict(lambda: None, {
 })
 
 def _get_valid_min_max(qparams):
-    scale, zero_point, quantized_type = qparams
+    scale, zero_point, _quantized_type = qparams
     adjustment = 1 + torch.finfo(torch.float).eps
     _long_type_info = torch.iinfo(torch.long)
     long_min, long_max = _long_type_info.min / adjustment, _long_type_info.max / adjustment
@@ -158,10 +162,12 @@ Example:
 @st.composite
 def array_shapes(draw, min_dims=1, max_dims=None, min_side=1, max_side=None, max_numel=None):
     """Return a strategy for array shapes (tuples of int >= 1)."""
-    assert(min_dims < 32)
+    if min_dims >= 32:
+        raise AssertionError(f"Expected min_dims < 32, got {min_dims}")
     if max_dims is None:
         max_dims = min(min_dims + 2, 32)
-    assert(max_dims < 32)
+    if max_dims >= 32:
+        raise AssertionError(f"Expected max_dims < 32, got {max_dims}")
     if max_side is None:
         max_side = min_side + 5
     candidate = st.lists(st.integers(min_side, max_side), min_size=min_dims, max_size=max_dims)
@@ -188,7 +194,7 @@ Generates:
         (If `qparams` arg is None), returns None.
 """
 @st.composite
-def tensor(draw, shapes=None, elements=None, qparams=None):
+def tensor(draw, shapes=None, elements=None, qparams=None, dtype=np.float32):
     if isinstance(shapes, SearchStrategy):
         _shape = draw(shapes)
     else:
@@ -196,7 +202,7 @@ def tensor(draw, shapes=None, elements=None, qparams=None):
     if qparams is None:
         if elements is None:
             elements = floats(-1e6, 1e6, allow_nan=False, width=32)
-        X = draw(stnp.arrays(dtype=np.float32, elements=elements, shape=_shape))
+        X = draw(stnp.arrays(dtype=dtype, elements=elements, shape=_shape))
         assume(not (np.isnan(X).any() or np.isinf(X).any()))
         return X, None
     qparams = draw(qparams)
@@ -204,7 +210,7 @@ def tensor(draw, shapes=None, elements=None, qparams=None):
         min_value, max_value = _get_valid_min_max(qparams)
         elements = floats(min_value, max_value, allow_infinity=False,
                           allow_nan=False, width=32)
-    X = draw(stnp.arrays(dtype=np.float32, elements=elements, shape=_shape))
+    X = draw(stnp.arrays(dtype=dtype, elements=elements, shape=_shape))
     # Recompute the scale and zero_points according to the X statistics.
     scale, zp = _calculate_dynamic_qparams(X, qparams[2])
     enforced_zp = _ENFORCED_ZERO_POINT.get(qparams[2], None)
@@ -248,7 +254,8 @@ def per_channel_tensor(draw, shapes=None, elements=None, qparams=None):
 The resulting tensors is in float32 format.
 
 Args:
-    spatial_dim: Spatial Dim for feature maps.
+    spatial_dim: Spatial Dim for feature maps. If given as an iterable, randomly
+                 picks one from the pool to make it the spatial dimension
     batch_size_range: Range to generate `batch_size`.
                       Must be tuple of `(min, max)`.
     input_channels_per_group_range:
@@ -295,7 +302,8 @@ def tensor_conv(
     draw, spatial_dim=2, batch_size_range=(1, 4),
     input_channels_per_group_range=(3, 7),
     output_channels_per_group_range=(3, 7), feature_map_range=(6, 12),
-    kernel_range=(3, 7), max_groups=1, elements=None, qparams=None
+    kernel_range=(3, 7), max_groups=1, can_be_transposed=False,
+    elements=None, qparams=None
 ):
 
     # Resolve the minibatch, in_channels, out_channels, iH/iW, iK/iW
@@ -308,48 +316,68 @@ def tensor_conv(
     input_channels = input_channels_per_group * groups
     output_channels = output_channels_per_group * groups
 
-    feature_map_shape = []
-    for i in range(spatial_dim):
-        feature_map_shape.append(draw(st.integers(*feature_map_range)))
+    if isinstance(spatial_dim, Iterable):
+        spatial_dim = draw(st.sampled_from(spatial_dim))
 
-    kernels = []
-    for i in range(spatial_dim):
-        kernels.append(draw(st.integers(*kernel_range)))
+    feature_map_shape = [draw(st.integers(*feature_map_range)) for _ in range(spatial_dim)]
+
+    kernels = [draw(st.integers(*kernel_range)) for _ in range(spatial_dim)]
+
+    tr = False
+    weight_shape = (output_channels, input_channels_per_group) + tuple(kernels)
+    bias_shape = output_channels
+    if can_be_transposed:
+        tr = draw(st.booleans())
+        if tr:
+            weight_shape = (input_channels, output_channels_per_group) + tuple(kernels)
+            bias_shape = output_channels
 
     # Resolve the tensors
     if qparams is not None:
         if isinstance(qparams, (list, tuple)):
-            assert(len(qparams) == 3), "Need 3 qparams for X, w, b"
+            if len(qparams) != 3:
+                raise AssertionError("Need 3 qparams for X, w, b")
         else:
             qparams = [qparams] * 3
 
     X = draw(tensor(shapes=(
         (batch_size, input_channels) + tuple(feature_map_shape),),
         elements=elements, qparams=qparams[0]))
-    W = draw(tensor(shapes=(
-        (output_channels, input_channels_per_group) + tuple(kernels),),
-        elements=elements, qparams=qparams[1]))
-    b = draw(tensor(shapes=(output_channels,), elements=elements,
+    W = draw(tensor(shapes=(weight_shape,), elements=elements,
+                    qparams=qparams[1]))
+    b = draw(tensor(shapes=(bias_shape,), elements=elements,
                     qparams=qparams[2]))
 
-    return X, W, b, groups
+    return X, W, b, groups, tr
+
 
 # We set the deadline in the currently loaded profile.
 # Creating (and loading) a separate profile overrides any settings the user
 # already specified.
-hypothesis_version = hypothesis.version.__version_info__
-current_settings = settings._profiles[settings._current_profile].__dict__
-current_settings['deadline'] = None
-if hypothesis_version >= (3, 16, 0) and hypothesis_version < (5, 0, 0):
-    current_settings['timeout'] = hypothesis.unlimited
+hypothesis_version = tuple(map(int, version("hypothesis").split(".")[:3]))
+
+if (3, 16, 0) <= hypothesis_version < (3, 27, 0):
+    # Hypothesis 3.16 → 3.26: use `timeout` instead of `deadline`
+    settings.register_profile("no_deadline", timeout=hypothesis.unlimited)
+else:
+    # Hypothesis >=3.27: use `deadline=None`
+    settings.register_profile("no_deadline", deadline=None)
+
+# Activate the profile
+settings.load_profile("no_deadline")
+
+
 def assert_deadline_disabled():
+    """Check that deadlines are effectively disabled across Hypothesis versions."""
     if hypothesis_version < (3, 27, 0):
         import warnings
+
         warning_message = (
             "Your version of hypothesis is outdated. "
             "To avoid `DeadlineExceeded` errors, please update. "
-            "Current hypothesis version: {}".format(hypothesis.__version__)
+            f"Current hypothesis version: {hypothesis.__version__}"
         )
-        warnings.warn(warning_message)
+        warnings.warn(warning_message, stacklevel=2)
     else:
-        assert settings().deadline is None
+        if settings().deadline is not None:
+            raise AssertionError("Expected settings().deadline to be None")

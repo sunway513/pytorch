@@ -2,9 +2,7 @@
 
 #include <torch/csrc/autograd/function.h>
 
-namespace torch {
-namespace distributed {
-namespace autograd {
+namespace torch::distributed::autograd {
 
 // As part of our distributed autograd implementation, whenever we send an RPC
 // from one node to another, we add a 'SendRpcBackward' autograd function to the
@@ -25,10 +23,11 @@ struct TORCH_API SendRpcBackward : public torch::autograd::Node {
   // computation.
   void setGrads(const torch::autograd::variable_list& grads);
 
+  // Retrieve the grads for the function.
+  const torch::autograd::variable_list& getGrads() const;
+
  private:
   torch::autograd::variable_list grads_;
 };
 
-} // namespace autograd
-} // namespace distributed
-} // namespace torch
+} // namespace torch::distributed::autograd

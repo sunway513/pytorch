@@ -17,7 +17,7 @@ class Tensor;
 // serves as a replacement return value for Tensor::type(). Previously,
 // Tensor::type() returned Type&, but we are changing Type to not be
 // dtype-specific.
-class CAFFE2_API DeprecatedTypeProperties {
+class TORCH_API DeprecatedTypeProperties {
  public:
   DeprecatedTypeProperties(Backend backend, ScalarType scalar_type)
     : backend_(backend), scalar_type_(scalar_type) {}
@@ -34,7 +34,11 @@ class CAFFE2_API DeprecatedTypeProperties {
     return layout_from_backend(backend()) == kSparse;
   }
 
-  DeviceType device_type() const {
+  bool is_sparse_csr() const {
+    return layout_from_backend(backend()) == kSparseCsr;
+  }
+
+  c10::DeviceType device_type() const {
     return backendToDeviceType(backend_);
   }
 
@@ -90,16 +94,20 @@ class CAFFE2_API DeprecatedTypeProperties {
     return toBackend(Backend::HIP);
   }
 
+  DeprecatedTypeProperties & privateUser1() const {
+    return toBackend(Backend::PrivateUse1);
+  }
+
   /// Constructs the `TensorOptions` from a type and a `device_index`.
   TensorOptions options(int16_t device_index = -1) const {
     return TensorOptions().dtype(typeMeta())
-                          .device(device_type(), device_index)
+                          .device(device_type(), static_cast<c10::DeviceIndex>(device_index))
                           .layout(layout());
   }
 
   /// Constructs the `TensorOptions` from a type and a Device.  Asserts that
   /// the device type matches the device type of the type.
-  TensorOptions options(c10::optional<Device> device_opt) const {
+  TensorOptions options(std::optional<Device> device_opt) const {
     if (!device_opt.has_value()) {
       return options(-1);
     } else {
@@ -121,7 +129,7 @@ class CAFFE2_API DeprecatedTypeProperties {
 
   Tensor unsafeTensorFromTH(void * th_pointer, bool retain) const;
   Storage unsafeStorageFromTH(void * th_pointer, bool retain) const;
-  Tensor copy(const Tensor & src, bool non_blocking=false, c10::optional<Device> to_device={}) const;
+  Tensor copy(const Tensor & src, bool non_blocking=false, std::optional<Device> to_device={}) const;
 
  private:
   Backend backend_;
